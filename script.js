@@ -4857,8 +4857,13 @@ function humanizeLaTeX(text) {
         .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&');
     ttsMap.forEach(map => { cleanText = cleanText.replace(map.r, map.s); });
     return cleanText
-        // Each break (single or repeated) becomes ONE full stop, unless the line already ends in punctuation
-        .replace(/([.!?\u2026:;,])?[ \t]*\n\s*/g, function (m, p) { return p ? p + ' ' : '. '; })
+        // Each break (single or repeated) becomes ONE full stop, unless the line already ends in punctuation.
+        // A paragraph break (blank line / double <br>, e.g. after a heading) also adds a hidden \u00b6 marker
+        // that _speakNext turns into a longer pause. The marker is stripped before anything is spoken.
+        .replace(/([.!?\u2026:;,])?[ \t]*\n\s*/g, function (m, p) {
+            if ((m.match(/\n/g) || []).length >= 2) return (p && /[.!?\u2026]/.test(p) ? p : '.') + '\u00b6 ';
+            return p ? p + ' ' : '. ';
+        })
         // Never leave doubled sentence punctuation behind (". .", "?.", etc.)
         .replace(/([.!?\u2026])(?:\s*[.!?\u2026])+/g, '$1')
         .replace(/\s+/g, ' ').trim();
@@ -4951,7 +4956,7 @@ function _speakNext(session) {
     // Queue chunks can hold several sentences. Speak one sentence at a time so the pause
     // after each full stop / question mark actually happens; the rest go back to the queue front.
     let chunk = ttsQueue.shift();
-    const parts = chunk.match(/.+?(?:[.!?\u2026]+(?=\s|$)|$)/g);
+    const parts = chunk.match(/.+?(?:[.!?\u2026]+\u00b6?(?=\s|$)|$)/g);
     if (parts && parts.length > 1) {
         const sentences = parts.map(function (x) { return x.trim(); }).filter(Boolean);
         if (sentences.length > 1) {
@@ -4959,6 +4964,10 @@ function _speakNext(session) {
             ttsQueue = sentences.concat(ttsQueue);
         }
     }
+    // \u00b6 = paragraph/heading boundary marker from humanizeLaTeX: remember it, never speak it
+    const paraBreak = chunk.indexOf('\u00b6') !== -1;
+    chunk = chunk.replace(/\u00b6/g, '').trim();
+    if (!chunk) { _speakNext(session); return; }
     ttsCurrentChunk = chunk;
 
     const u = new SpeechSynthesisUtterance(chunk);
@@ -5012,6 +5021,7 @@ function _speakNext(session) {
         } else if (/[,;:]/.test(lastChar)) {
             pauseTime = 250;     // quick breath
         }
+        if (paraBreak) pauseTime = Math.max(pauseTime, 900);   // heading -> body, paragraph -> paragraph
         advance(pauseTime);
     };
     u.onerror = function (e) {
