@@ -3,7 +3,58 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-  <title>Quiz App - Courses & Terms | Kaeri EdTech</title>
+  <title>Kaeri EdTech | CBU Revision Quizzes, Flashcards &amp; Study Kits</title>
+  <meta name="description" content="Kaeri EdTech: study smarter with MCQ, short-answer and flashcard revision for Copperbelt University (CBU) courses in Zambia. Try free, unlock full access by mobile money.">
+  <meta name="robots" content="index, follow, max-image-preview:large">
+  <meta name="theme-color" content="#0d1b2a">
+  <meta name="application-name" content="Kaeri EdTech">
+  <link rel="canonical" href="https://kaerikalmar.github.io/KaeriEdTech/">
+  <link rel="icon" href="assets/logo.png" type="image/png">
+  <link rel="apple-touch-icon" href="assets/logo.png">
+
+  <!-- Open Graph / WhatsApp / Facebook previews -->
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="Kaeri EdTech">
+  <meta property="og:title" content="Kaeri EdTech | Study Smarter. Grow Confident.">
+  <meta property="og:description" content="Kaeri EdTech: study smarter with MCQ, short-answer and flashcard revision for Copperbelt University (CBU) courses in Zambia. Try free, unlock full access by mobile money.">
+  <meta property="og:url" content="https://kaerikalmar.github.io/KaeriEdTech/">
+  <meta property="og:image" content="https://kaerikalmar.github.io/KaeriEdTech/assets/logo.png">
+  <meta property="og:image:alt" content="Kaeri EdTech logo">
+  <meta property="og:locale" content="en_ZM">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="Kaeri EdTech | Study Smarter. Grow Confident.">
+  <meta name="twitter:description" content="Kaeri EdTech: study smarter with MCQ, short-answer and flashcard revision for Copperbelt University (CBU) courses in Zambia. Try free, unlock full access by mobile money.">
+  <meta name="twitter:image" content="https://kaerikalmar.github.io/KaeriEdTech/assets/logo.png">
+
+  <!-- Structured data: tells search engines "Kaeri EdTech" is one organisation with this website -->
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@graph": [
+      {
+        "@type": "EducationalOrganization",
+        "@id": "https://kaerikalmar.github.io/KaeriEdTech/#organization",
+        "name": "Kaeri EdTech",
+        "alternateName": ["Kaeri", "Kaeri EdTech Zambia"],
+        "url": "https://kaerikalmar.github.io/KaeriEdTech/",
+        "logo": "https://kaerikalmar.github.io/KaeriEdTech/assets/logo.png",
+        "slogan": "Study Smarter. Grow Confident.",
+        "description": "Revision quizzes, flashcards and study kits for Copperbelt University (CBU) students in Zambia.",
+        "areaServed": { "@type": "Country", "name": "Zambia" },
+        "email": "kaeriedtech@gmail.com",
+        "sameAs": ["https://whatsapp.com/channel/0029VbCc0hEL7UVMs55diC3i"]
+      },
+      {
+        "@type": "WebSite",
+        "@id": "https://kaerikalmar.github.io/KaeriEdTech/#website",
+        "url": "https://kaerikalmar.github.io/KaeriEdTech/",
+        "name": "Kaeri EdTech",
+        "inLanguage": "en",
+        "publisher": { "@id": "https://kaerikalmar.github.io/KaeriEdTech/#organization" }
+      }
+    ]
+  }
+  </script>
 
   <!-- FONTS -->
   <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap" rel="stylesheet">
@@ -313,6 +364,21 @@
     }
     #tts-toggle-button { background-color: #6610f2; }
     #tts-toggle-button:hover { background-color: #520dc2; }
+    #tts-settings-button { background-color: #4a0fb5; }
+    #tts-settings-button:hover { background-color: #3c0c94; }
+    /* Reader tools in the quiz strip */
+    #qs-tools { display:flex; align-items:center; }
+    #quiz-strip #qs-tools button { width:38px; height:44px; font-size:1.15rem; }
+    #qs-pause { display:none; }
+    body.tts-active #qs-pause { display:inline-block; }
+    html.no-tts #qs-tools, html.no-tts #tts-toggle-button, html.no-tts #tts-settings-button { display:none !important; }
+    #quiz-form:focus { outline:none; }
+    /* Reader settings dialog */
+    #tts-modal label, #tts-modal .tts-row { display:block; text-align:left; color:#a0a8b4; font-size:.9rem; margin:12px 0 6px; }
+    #tts-modal select { width:100%; padding:11px; border-radius:8px; background:#0d1b2a; color:#fff; border:1px solid #2b3a55; font-size:1rem; }
+    #tts-modal input[type=range] { width:100%; }
+    #tts-modal .tts-check { display:flex; align-items:center; gap:10px; margin:14px 0 0; color:#e0e6ed; }
+    #tts-modal .tts-check input { width:20px; height:20px; }
 
     #quiz-form { 
     background-color: #0d1b2a; 
@@ -1579,6 +1645,17 @@
     .empty-progress { text-align:center; padding:30px 10px; }
     .empty-progress .ep-actions { display:flex; gap:10px; justify-content:center; flex-wrap:wrap; margin-top:16px; }
 
+    /* ===== SHELL ACTIONS BAR (populated by setShellActions) ===== */
+    .shell-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+      justify-content: center;
+      margin-top: 20px;
+    }
+    .shell-actions:empty { display: none; }
+
     /* Floating WhatsApp (draggable) */
     #draggable-wa { right:max(16px, env(safe-area-inset-right)); bottom:max(16px, env(safe-area-inset-bottom)); z-index:900; touch-action:none; user-select:none; -webkit-user-select:none; }
 
@@ -1618,9 +1695,16 @@
     .hdr-brand { display:inline-flex; align-items:center; gap:7px; color:inherit; opacity:1; font-size:.8rem; letter-spacing:1.2px; }
     .hdr-brand .wordmark { font-size:.8rem; text-shadow:none; }
     @media (max-width:359px){ .lockup .wordmark { font-size:1.2rem; } .lockup .brand-tag { font-size:.72rem; } }
+  
+    /* SEO: real <h1> + intro text for search engines and screen readers, not shown visually */
+    .sr-only { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap; border:0; }
   </style>
 </head>
 <body>
+  <h1 class="sr-only">Kaeri EdTech: revision quizzes and flashcards for CBU students</h1>
+  <p class="sr-only">Kaeri EdTech helps Copperbelt University (CBU) students in Zambia revise with MCQ practice, short-answer questions and flashcards. Courses: BI110 Biology, CS110 Computer Science, LA111 Communication Skills, MA110 Mathematics, PH110 Physics and CH110 Chemistry. Try it free, then unlock full access with mobile money.</p>
+  <noscript><p style="padding:16px;color:#fff;">Kaeri EdTech needs JavaScript to run quizzes. Please enable JavaScript in your browser.</p></noscript>
+
 
   <!-- ==================== NOTIFICATIONS ==================== -->
   <div id="app-notification" role="alert">
@@ -1650,7 +1734,7 @@
         <div id="progress-container"><div id="progress-fill"></div></div>
         <div id="progress-text">Progress: 0 of 0</div>
       </div>
-      <div id="price-banner">Price: K15</div>
+      <div id="price-banner">Price: —</div>
       <button id="unlock-btn" onclick="openPaymentModal()">🔓 Unlock Full Access</button>
     </div>
   </div>
@@ -1659,7 +1743,12 @@
   <div id="quiz-strip">
     <button type="button" onclick="exitQuiz()" aria-label="Exit quiz">←</button>
     <span id="qs-count">Q 0 / 0</span>
-    <button type="button" id="qs-tts" onclick="toggleTTS()" aria-label="Toggle reader">🔇</button>
+    <span id="qs-tools">
+      <button type="button" id="qs-replay" onclick="replayReading()" aria-label="Read this again">🔁</button>
+      <button type="button" id="qs-pause" onclick="toggleReadPause()" aria-label="Pause or resume reading">⏸</button>
+      <button type="button" id="qs-tts" onclick="toggleTTS()" aria-label="Turn reader on or off">🔇</button>
+      <button type="button" id="qs-settings" onclick="openTtsSettings()" aria-label="Reader settings">⚙️</button>
+    </span>
     <div id="qs-bar"><div id="qs-fill"></div></div>
   </div>
 
@@ -1695,12 +1784,12 @@
           <h1>Select a Course</h1>
         </div>
         <div id="course-list">
-        <div class="course-section"><button class="course-button" onclick="toggleTerms('bi110')">BI110 - Biology</button><div id="bi110-terms" class="term-buttons"><button onclick="loadCourse('BI110', 'T1', 15)">Term 1</button><button onclick="loadCourse('BI110', 'T2', 15)">Term 2</button><button onclick="loadCourse('BI110', 'T3', 20)">Term 3</button></div></div>
-        <div class="course-section"><button class="course-button" onclick="toggleTerms('cs110')">CS110 - Computer Science</button><div id="cs110-terms" class="term-buttons"><button onclick="loadCourse('CS110', 'T1', 15)">Term 1</button><button onclick="loadCourse('CS110', 'T2', 15)">Term 2</button><button onclick="loadCourse('CS110', 'T3', 20)">Term 3</button></div></div>
-        <div class="course-section"><button class="course-button" onclick="toggleTerms('la111')">LA111 - Communication Skills</button><div id="la111-terms" class="term-buttons"><button onclick="loadCourse('LA111', 'T1', 15)">Term 1</button><button onclick="loadCourse('LA111', 'T2', 15)">Term 2</button><button onclick="loadCourse('LA111', 'T3', 20)">Term 3</button></div></div>
-        <div class="course-section"><button class="course-button" onclick="toggleTerms('ma110')">MA110 – Mathematics</button><div id="ma110-terms" class="term-buttons"><button onclick="loadCourse('MA110', 'T1', 15)">Term 1</button><button onclick="loadCourse('MA110', 'T2', 15)">Term 2</button><button onclick="loadCourse('MA110', 'T3', 20)">Term 3</button></div></div>
-        <div class="course-section"><button class="course-button" onclick="toggleTerms('ph110')">PH110 – Physics</button><div id="ph110-terms" class="term-buttons"><button onclick="loadCourse('PH110', 'T1', 15)">Term 1</button><button onclick="loadCourse('PH110', 'T2', 15)">Term 2</button><button onclick="loadCourse('PH110', 'T3', 20)">Term 3</button></div></div>
-        <div class="course-section"><button class="course-button" onclick="toggleTerms('ch110')">CH110 – Chemistry</button><div id="ch110-terms" class="term-buttons"><button onclick="loadCourse('CH110', 'T1', 15)">Term 1</button><button onclick="loadCourse('CH110', 'T2', 15)">Term 2</button><button onclick="loadCourse('CH110', 'T3', 20)">Term 3</button></div></div>
+        <div class="course-section"><button class="course-button" onclick="toggleTerms('bi110')">BI110 - Biology</button><div id="bi110-terms" class="term-buttons"><button onclick="loadCourse('BI110', 'T1')">Term 1</button><button onclick="loadCourse('BI110', 'T2')">Term 2</button><button onclick="loadCourse('BI110', 'T3')">Term 3</button></div></div>
+        <div class="course-section"><button class="course-button" onclick="toggleTerms('cs110')">CS110 - Computer Science</button><div id="cs110-terms" class="term-buttons"><button onclick="loadCourse('CS110', 'T1')">Term 1</button><button onclick="loadCourse('CS110', 'T2')">Term 2</button><button onclick="loadCourse('CS110', 'T3')">Term 3</button></div></div>
+        <div class="course-section"><button class="course-button" onclick="toggleTerms('la111')">LA111 - Communication Skills</button><div id="la111-terms" class="term-buttons"><button onclick="loadCourse('LA111', 'T1')">Term 1</button><button onclick="loadCourse('LA111', 'T2')">Term 2</button><button onclick="loadCourse('LA111', 'T3')">Term 3</button></div></div>
+        <div class="course-section"><button class="course-button" onclick="toggleTerms('ma110')">MA110 – Mathematics</button><div id="ma110-terms" class="term-buttons"><button onclick="loadCourse('MA110', 'T1')">Term 1</button><button onclick="loadCourse('MA110', 'T2')">Term 2</button><button onclick="loadCourse('MA110', 'T3')">Term 3</button></div></div>
+        <div class="course-section"><button class="course-button" onclick="toggleTerms('ph110')">PH110 – Physics</button><div id="ph110-terms" class="term-buttons"><button onclick="loadCourse('PH110', 'T1')">Term 1</button><button onclick="loadCourse('PH110', 'T2')">Term 2</button><button onclick="loadCourse('PH110', 'T3')">Term 3</button></div></div>
+        <div class="course-section"><button class="course-button" onclick="toggleTerms('ch110')">CH110 – Chemistry</button><div id="ch110-terms" class="term-buttons"><button onclick="loadCourse('CH110', 'T1')">Term 1</button><button onclick="loadCourse('CH110', 'T2')">Term 2</button><button onclick="loadCourse('CH110', 'T3')">Term 3</button></div></div>
         </div>
         <div class="page-footer">
           <hr>
@@ -1720,8 +1809,8 @@
         <details id="pricing-details">
           <summary>💰 Pricing &amp; Payment Info</summary>
           <p class="price-list">
-  💰 <strong><span id="price-desc">Course</span>:</strong> 
-  <span id="price-val" style="font-size:1.1em;">K15</span>
+  💰 <strong><span id="price-desc">Select a course</span>:</strong> 
+  <span id="price-val" style="font-size:1.1em;">—</span>
 
   <br><br>
 
@@ -1760,6 +1849,10 @@
       <div id="quiz-form"></div>
       <div id="result"></div>
 
+      <!-- Shell action bar — populated by setShellActions() when a mode is open.
+           Renders empty (and hidden via .shell-actions:empty) when no actions exist. -->
+      <div class="shell-actions" role="group" aria-label="Mode actions"></div>
+
       <button onclick="backToMenu()" class="back-button">⬅️ Back to Course Selection</button>
 
       <div class="course-footer">
@@ -1785,7 +1878,8 @@
     <div class="pay-header">
       <h2>🔓 Unlock Access</h2>
       <p id="pay-term-name">Loading...</p>
-      <span id="pay-amount" style="display:block; margin-top:6px; font-size:1.1rem; color:#72efdd;">K0.00</span>
+      <span id="pay-amount" style="display:block; margin-top:6px; font-size:1.1rem; color:#72efdd;">—</span>
+      <span id="pay-duration" style="display:block; margin-top:4px; font-size:0.85rem; color:#a0a8b4;"></span>
     </div>
     <div class="pay-body">
 
@@ -1830,9 +1924,19 @@
           </div>
 
           <!-- Price box -->
-          <div class="price-box">
-            <span style="color:#a0a8b4;">Amount Due:</span>
-            <span id="priceDisplay" style="font-weight:700; color:#72efdd; font-size:1.2rem;">K0.00</span>
+          <div class="price-box" style="display:block;">
+            <div style="display:flex; justify-content:space-between; align-items:center;">
+              <span style="color:#a0a8b4;">Amount Due:</span>
+              <span id="priceDisplay" style="font-weight:700; color:#72efdd; font-size:1.2rem;">K0.00</span>
+            </div>
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-top:6px;">
+              <span style="color:#a0a8b4; font-size:0.9em;">Access Duration:</span>
+              <span id="durationDisplay" style="color:#72efdd; font-size:0.9em;">—</span>
+            </div>
+            <div id="devicesRow" style="display:none; justify-content:space-between; align-items:center; margin-top:6px;">
+              <span style="color:#a0a8b4; font-size:0.9em;">Works on:</span>
+              <span id="devicesDisplay" style="color:#72efdd; font-size:0.9em;">—</span>
+            </div>
           </div>
 
           <!-- Phone & Ref -->
@@ -1879,22 +1983,22 @@
               <p>4️⃣ <strong>Submit:</strong> Wait for admin verification.</p>
               <p>5️⃣ <strong>Check status:</strong> Use the "Check Status" tab above — your code appears once approved, with a one‑tap copy button.</p>
               <p>6️⃣ <strong>Activate:</strong> Paste the code in the "Already have a Code?" section below.</p>
-              <p class="guide-confirm-line" style="color:#72efdd;">✅ Valid code gives 20 days of full access.</p>
+              <p class="guide-confirm-line" style="color:#72efdd;">✅ Valid code gives full access for the plan duration (see amount line).</p>
             </div>
           </details>
           <div class="extra-price-cards">
-            <div class="price-card-addon" onclick="showExtraPlanInfo('Full Course', 'K50')">
+            <div class="price-card-addon" data-plan-card="full" role="button" tabindex="0" onclick="onFullCourseClick()" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();onFullCourseClick();}">
               <span class="plan-name">Full Course</span>
-              <span class="plan-price">K50</span>
-              <span class="plan-desc">Best for exams</span>
+              <span class="plan-price" data-plan="full-course">—</span>
+              <span class="plan-desc" data-plan-duration="full-course">All terms</span>
             </div>
-            <div class="price-card-addon featured" onclick="showExtraPlanInfo('Global Access', 'K300')">
+            <div class="price-card-addon featured" data-plan-card="global" role="button" tabindex="0" onclick="onGlobalClick()" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();onGlobalClick();}">
               <span class="plan-name">Global Access</span>
-              <span class="plan-price">K300</span>
-              <span class="plan-desc">All Courses & terms</span>
+              <span class="plan-price" data-plan="global">—</span>
+              <span class="plan-desc" data-plan-duration="global">Every course</span>
             </div>
           </div>
-          <div class="note-text">💡 Click on any price card to learn more – coming soon!</div>
+          <div class="note-text">💡 Tap a plan card to fill the form for you. Price and duration come live from the price list.</div>
         </div>
       </div> <!-- /pay-view -->
 
@@ -1918,7 +2022,17 @@
         </div>
       </div>
 
-   
+      <!-- Become an Ambassador (kept) -->
+      <div style="margin-top:20px; background:#0d1b2a; border:1px solid #3e506e; border-radius:8px; padding:15px;">
+        <h4 style="margin:0 0 8px 0; color:#28a745;">🚀 Become an Ambassador</h4>
+        <p style="margin:0 0 12px 0; font-size:0.9em; color:#a0a8b4;">
+          Earn rewards & free access by sharing
+        </p>
+        <a data-amb-link href="AMB-PORTAL.html" target="_blank" rel="noopener"
+           style="display:block; box-sizing:border-box; width:100%; text-align:center; text-decoration:none; background:#28a745; color:white; padding:12px; border-radius:6px; font-weight:bold; cursor:pointer; transition:0.3s;">
+          Join Now – It's Free →
+        </a>
+      </div>
 
       <button class="cancel-pay-btn" onclick="closePaymentModal()">Maybe Later (Use Demo)</button>
 
@@ -1935,6 +2049,38 @@
       <div class="r-actions">
         <button type="button" class="r-btn r-cancel" onclick="closeResetModal()">Cancel</button>
         <button type="button" class="r-btn r-danger" onclick="confirmResetProgress()">Reset</button>
+      </div>
+    </div>
+  </div>
+
+<!-- READER SETTINGS -->
+  <div id="tts-modal" class="r-modal" role="dialog" aria-modal="true" aria-labelledby="tts-title">
+    <div class="r-card sm">
+      <div style="font-size:2.2rem;">🔊</div>
+      <h3 id="tts-title">Reader settings</h3>
+      <label class="tts-check" for="tts-on" style="margin-top:4px;">
+        <input type="checkbox" id="tts-on" onchange="toggleTTS()"> Read questions aloud automatically
+      </label>
+      <label for="tts-voice">Voice</label>
+      <select id="tts-voice" onchange="setTtsVoice(this.value)"><option value="">Automatic (best English voice)</option></select>
+      <label for="tts-rate">Speed: <strong id="tts-rate-label">1×</strong></label>
+      <input type="range" id="tts-rate" min="0.6" max="1.6" step="0.1" value="1" oninput="setTtsRate(this.value)">
+      <div class="r-actions">
+        <button type="button" class="r-btn r-cancel" onclick="testTtsVoice()">▶ Test</button>
+        <button type="button" class="r-btn" style="background:#007bff;" data-autofocus onclick="closeTtsSettings()">Done</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- RESET MCQ TRACKING CONFIRMATION -->
+  <div id="pool-reset-modal" class="r-modal" role="dialog" aria-modal="true" aria-labelledby="pool-reset-title">
+    <div class="r-card sm">
+      <div style="font-size:2.2rem;">🎯</div>
+      <h3 id="pool-reset-title">Reset question tracking?</h3>
+      <p style="color:#a0a8b4; margin:0;">Your to-fix, building and mastered counts for this term start again from zero. Your quiz scores and progress are not affected.</p>
+      <div class="r-actions">
+        <button type="button" class="r-btn r-cancel" onclick="closePoolResetModal()">Cancel</button>
+        <button type="button" class="r-btn r-danger" onclick="confirmResetPool()">Reset</button>
       </div>
     </div>
   </div>
@@ -1987,7 +2133,7 @@
   <!-- EXTERNAL ASSETS -->
   <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
 
-  <script src="assets/mcqDa.js"></script>
+
   <script src="assets/shortDa.js"></script>
   <script src="assets/essayDa.js"></script>
   <script src="assets/flashcards.js"></script>
@@ -1996,21 +2142,8 @@
   <script src="assets/motivation.js"></script>
   <script src="acc.js"></script>
   <script src="script.js"></script>
-  <script src="quiz_srs_patch.js"></script>
-  <script src="ExamCountdown.js"></script>
+<script src="ExamCountdown.js"></script>
 <script src="ScoreCelebration.js"></script>
 <script src="Advanced_SA.js"></script>
-
-  
-  <!-- ADDITIONAL SAFE JAVASCRIPT FOR EXTRA PRICE CARDS (DOES NOT OVERRIDE ANY EXISTING FUNCTION) -->
-  <script>
-    // Simple helper for the extra price cards – does not break any existing logic
-    function showExtraPlanInfo(plan, price) {
-      showAppNotification(`ℹ️ ${plan} (${price}) – coming soon! For now, use "Buy Now" for single term.`, "info", 4000);
-    }
-    // Ensure idempotency reset for the subscription guide (already handled in original closePaymentModal)
-    // The original closePaymentModal already removes the "open" attribute – we keep it unchanged.
-    // No other modifications.
-  </script>
-</body>
+</body> 
 </html>

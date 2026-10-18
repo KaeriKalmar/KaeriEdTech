@@ -4,28 +4,247 @@
 // === Enhanced with Silent Revalidation, Expiry Display, and Analytics ===
 // === NEW: Professional Revision Kit Generator (Branded Covers + Session Metadata) ===
 // === ADDITIVE SAFE UPDATES: Subscription guide idempotency + extra plan info helper ===
+// === v1.1 PATCH: KAERI_CONFIG + PRICE_MAP consolidation (behavior unchanged) ===
+// === v1.2 PATCH: MCQ manifest loader (per-term lazy loading; demo contract unchanged) ===
+// === v1.3 PATCH: SYSTEM_CONFIG from getSystemConfig + MCQ wrong-answer pool (no PRICE_MAP live) ===
+// === v1.4 PATCH: no hardcoded prices/durations anywhere; race-free plan cards; streak-based MCQ pool + banner ===
+// === v1.5 PATCH: reader (voice/speed/pause/replay), pool right/wrong tally + building, ghost functions wired or removed ===
+// === v1.6 PATCH: naturalSort applied to unit and sub-topic ordering ===
 // ============================================================
 
-// --- CONFIGURATION & STATE ---
+// --- CONFIGURATION ---
 
-// 1. BASE B URL (Handles Auth, Analytics, Payment, Session)
-const APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbwBKr4ZAc6m_rehmEywaJhbbiN7G9sWbmvtE544lNZOWgD7e906JxW7Bz4ZuA59sSPfvg/exec";
+const KAERI_CONFIG = {
+    // Brand
+    brandName:          'Kaeri EdTech',
+    brandTagline:       'Empowering Learners Through Smart Educational Technology',
+    brandShort:         'KAERI EDTECH',
+    siteUrl:            'https://kaerikalmar.github.io/KaeriEdTech',
 
-// 2. BASE A URL (Handles Document Library Fetching ONLY)
-const DOCS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbxhbrFtkTCj-6ZmnY0xmGjwxIq8YoP3mHEghVbEb4ZnVn_sKoCL_VI3CdsjEjibnGIFbQ/exec";
+    // Backend endpoints
+    appsScriptUrl:      "https://script.google.com/macros/s/AKfycbwBKr4ZAc6m_rehmEywaJhbbiN7G9sWbmvtE544lNZOWgD7e906JxW7Bz4ZuA59sSPfvg/exec",
+    docsScriptUrl:      "https://script.google.com/macros/s/AKfycbxhbrFtkTCj-6ZmnY0xmGjwxIq8YoP3mHEghVbEb4ZnVn_sKoCL_VI3CdsjEjibnGIFbQ/exec",
+    paymentScriptUrl:   "https://script.google.com/macros/s/AKfycbxtCC6oKKm2LNp4ktASmNFE0aSPehGnqui6FKmnxk1-AHktl_X8mTT1dZFRf00hxk6qOg/exec",
+    paymentApiUrl:      "https://script.google.com/macros/s/AKfycbxtCC6oKKm2LNp4ktASmNFE0aSPehGnqui6FKmnxk1-AHktl_X8mTT1dZFRf00hxk6qOg/exec",
 
-const PAYMENT_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbz2g3G6nxVlUW3afcHFpvKY360Qd-XoAKkJ7Jz20pznebDrpBHGKjgkhgC4DMXijnN_/exec";
+    // Ambassador cross-app.
+    // The portal handles referral tracking itself and redirects back, so
+    // product-side capture stays OFF (ambassadorApiUrl empty) to avoid double-counting.
+    ambassadorPortalUrl: "AMB-PORTAL.html", // relative: portal sits in the same folder as index.html
+    ambassadorApiUrl:    "",                // TODO: paste the ambassador backend /exec URL to enable referral capture
 
-// Cross-app link to the Ambassador Portal (single source of truth for every Ambassador button).
-// The portal now handles referral tracking itself and redirects back to this site,
-// so product-side capture below stays OFF (AMBASSADOR_API_URL empty) to avoid double-counting.
-const AMBASSADOR_PORTAL_URL = "AMB-PORTAL.html"; // relative: portal sits in the same folder as index.html
-const AMBASSADOR_API_URL = ""; // TODO: paste the ambassador backend /exec URL. While empty, referral capture stays off.
+    // Limits and timers
+    demoAttemptLimit:           10,
+    revalidationMs:             300000,
+    revalidationWarmupMs:       5000,
+    courseLoadDelayMs:          100,
+    paymentRetries:             3,
+    paymentRetryGapMs:          1000,
+    paymentTimeoutMs:           30000,
+    maxPaymentScreenshotBytes:  5 * 1024 * 1024,
+    printPopupBlockDelayMs:     60000
+};
+
+// Named aliases — every other section keeps reading these without touching the config object.
+const APPS_SCRIPT_URL       = KAERI_CONFIG.appsScriptUrl;
+const DOCS_SCRIPT_URL       = KAERI_CONFIG.docsScriptUrl;
+const PAYMENT_SCRIPT_URL    = KAERI_CONFIG.paymentScriptUrl;
+const AMBASSADOR_PORTAL_URL = KAERI_CONFIG.ambassadorPortalUrl;
+const AMBASSADOR_API_URL    = KAERI_CONFIG.ambassadorApiUrl;
+
+// ============================================================
+// === LIVE SYSTEM CONFIG: prices + durations ===
+// Single source of truth = AppConfig sheet (via getSystemConfig).
+// NOTHING in this file hardcodes a price or a duration. If the live
+// config is not available the UI shows "—" instead of guessing.
+// ============================================================
+let SYSTEM_CONFIG = { inventory: {}, durations: {}, maxDevices: {}, loaded: false, loadedAt: 0, error: '' };
+let _configInflight = null;
+const CONFIG_FRESH_MS = 60 * 1000;   // reuse a fetched config for 60s, then refresh in the background
+let purchaseIntent = null;           // { course, term } requested by a plan card, consumed once by renderPaymentForm()
+
+function _up(v) { return String(v || '').trim().toUpperCase(); }
+
+function _cfgNumber(map, course, term) {
+    try {
+        const row = map && map[_up(course)];
+        if (row && row[_up(term)] != null) {
+            const n = Number(row[_up(term)]);
+            if (isFinite(n)) return n;
+        }
+    } catch (e) {}
+    return null;
+}
+
+/** Live price or null (never a guess). */
+function getPriceFor(course, term) {
+    const n = _cfgNumber(SYSTEM_CONFIG.inventory, course, term);
+    return (n !== null && n >= 0) ? n : null;
+}
+
+/** Live duration in days or null (never a guess). */
+function getDurationFor(course, term) {
+    const n = _cfgNumber(SYSTEM_CONFIG.durations, course, term);
+    return (n !== null && n > 0) ? n : null;
+}
+
+function getMaxDevicesFor(course, term) {
+    const n = _cfgNumber(SYSTEM_CONFIG.maxDevices, course, term);
+    return (n !== null && n > 0) ? n : null;
+}
+
+function formatPrice(n) {
+    if (n === null || n === undefined || !isFinite(n)) return '—';
+    return 'K' + (Math.round(n) === n ? n : n.toFixed(2));
+}
+
+function formatDays(n) {
+    if (n === null || n === undefined || !isFinite(n)) return '';
+    return n + (n === 1 ? ' day' : ' days');
+}
+
+/** Course/term currently open in the study view (set synchronously by loadCourse). */
+function getViewedScope() {
+    return {
+        course: _up(document.body.getAttribute('data-course')),
+        term: _up(document.body.getAttribute('data-term'))
+    };
+}
+
+function payScopeLabel(course, term) {
+    const c = _up(course), t = _up(term);
+    if (c === 'ALL' && t === 'ALL') return '🌍 Global Access · all courses';
+    if (t === 'ALL') return c + ' · Full Course (all terms)';
+    return c + ' ' + t;
+}
+
+/** Fetch live inventory/durations/maxDevices. Safe to call often (cached + single-flight). */
+function loadSystemConfig(force) {
+    if (!force && SYSTEM_CONFIG.loaded && (Date.now() - SYSTEM_CONFIG.loadedAt) < CONFIG_FRESH_MS) {
+        return Promise.resolve(SYSTEM_CONFIG);
+    }
+    if (_configInflight) return _configInflight;
+    _configInflight = callPaymentApi('getSystemConfig', {})
+        .then(function (res) {
+            if (!res || !res.success) throw new Error((res && res.message) || 'Could not load prices.');
+            SYSTEM_CONFIG.inventory  = res.inventory  || {};
+            SYSTEM_CONFIG.durations  = res.durations  || {};
+            SYSTEM_CONFIG.maxDevices = res.maxDevices || {};
+            SYSTEM_CONFIG.loaded = true;
+            SYSTEM_CONFIG.loadedAt = Date.now();
+            SYSTEM_CONFIG.error = '';
+            inventory = SYSTEM_CONFIG.inventory;     // the payment form's dropdowns read this
+            refreshPriceUI();
+            return SYSTEM_CONFIG;
+        })
+        .catch(function (err) {
+            SYSTEM_CONFIG.error = (err && err.message) || 'offline';
+            throw err;
+        })
+        .then(function (v) { _configInflight = null; return v; },
+              function (e) { _configInflight = null; throw e; });
+    return _configInflight;
+}
+
+/** Banner + pricing text inside the course view. Never unhides the banner (full-access users keep it hidden). */
+function renderCourseBanner(course, term) {
+    const price = getPriceFor(course, term);
+    const days = getDurationFor(course, term);
+    currentPrice = price;
+
+    let bannerText, valText;
+    if (price === null) {
+        bannerText = SYSTEM_CONFIG.error && !SYSTEM_CONFIG.loaded ? 'Price unavailable (offline)'
+                   : SYSTEM_CONFIG.loaded ? 'Price unavailable' : 'Loading price…';
+        valText = '—';
+    } else {
+        bannerText = formatPrice(price) + (days ? ' · ' + formatDays(days) : '');
+        valText = formatPrice(price) + (days ? ' for ' + formatDays(days) : '');
+    }
+    const banner = document.getElementById('price-banner');
+    if (banner) banner.textContent = bannerText;
+    const priceVal = document.getElementById('price-val');
+    if (priceVal) priceVal.textContent = valText;
+    const priceDesc = document.getElementById('price-desc');
+    if (priceDesc) priceDesc.textContent = course + ' Term ' + String(term).replace(/^T/i, '');
+}
+
+/** Re-render every price/duration surface from the live config. */
+function refreshPriceUI() {
+    try {
+        const v = getViewedScope();
+        if (v.course && v.term) renderCourseBanner(v.course, v.term);
+        updatePlanCards();
+        const modal = document.getElementById('payment-modal');
+        if (modal && modal.classList.contains('show')) updatePrice();
+    } catch (e) { console.warn('[refreshPriceUI]', e); }
+}
+
+function _setPlanCard(kind, price, days, baseText, hasContext) {
+    const key = kind === 'full' ? 'full-course' : 'global';
+    const card = document.querySelector('[data-plan-card="' + kind + '"]');
+    // Hide a card only when we KNOW the plan is not sold (config loaded, context known, no price).
+    const unavailable = SYSTEM_CONFIG.loaded && hasContext && price === null;
+    if (card) card.style.display = unavailable ? 'none' : '';
+    document.querySelectorAll('[data-plan="' + key + '"]').forEach(function (el) {
+        el.textContent = formatPrice(price);
+    });
+    document.querySelectorAll('[data-plan-duration="' + key + '"]').forEach(function (el) {
+        el.textContent = baseText + (days ? ' · ' + formatDays(days) : '');
+    });
+}
+
+/** Full Course + Global cards: live price AND live duration. The Full Course card follows the course in view / selected. */
+function updatePlanCards(course) {
+    const cs = document.getElementById('courseSelect');
+    const selected = cs ? _up(cs.value) : '';
+    const c = _up(course) || (selected && selected !== 'ALL' ? selected : '') || getViewedScope().course || _up(currentCourse);
+    _setPlanCard('full',
+        c ? getPriceFor(c, 'ALL') : null,
+        c ? getDurationFor(c, 'ALL') : null,
+        c ? 'All terms' : 'Pick a course first',
+        !!c);
+    _setPlanCard('global', getPriceFor('ALL', 'ALL'), getDurationFor('ALL', 'ALL'), 'Every course', true);
+}
+
+/** Which course should the Full Course card buy? Dropdown choice → course in view → last opened. */
+function _resolveFullCourse() {
+    const cs = document.getElementById('courseSelect');
+    const picked = cs ? _up(cs.value) : '';
+    if (picked && picked !== 'ALL') return picked;
+    return getViewedScope().course || _up(currentCourse) || '';
+}
+
+function onFullCourseClick() {
+    const course = _resolveFullCourse();
+    if (!course) {
+        showAppNotification('Choose a course in the form above first, then tap Full Course.', 'info', 3500);
+        const cs = document.getElementById('courseSelect');
+        if (cs) { try { cs.focus(); } catch (e) {} }
+        return;
+    }
+    if (SYSTEM_CONFIG.loaded && getPriceFor(course, 'ALL') === null) {
+        showAppNotification('⚠️ Full Course is not available for ' + course + ' right now.', 'warning', 3500);
+        return;
+    }
+    openPaymentModal({ course: course, term: 'ALL' });
+}
+
+function onGlobalClick() {
+    if (SYSTEM_CONFIG.loaded && getPriceFor('ALL', 'ALL') === null) {
+        showAppNotification('⚠️ Global Access is not available right now.', 'warning', 3500);
+        return;
+    }
+    openPaymentModal({ course: 'ALL', term: 'ALL' });
+}
+
+
+// --- STATE ---
 
 let ttsEnabled = false;
 let printContentData = null;
 let hasFullAccess = false;
-let currentPrice = 15;
+let currentPrice = null; // set by loadCourse from SYSTEM_CONFIG / fallback
 let isSubmissionLocked = false; 
 
 // --- User session data (for silent revalidation & analytics) ---
@@ -34,7 +253,8 @@ let userCode = '';
 let deviceFP = '';
 
 // --- DATA CONTAINERS ---
-let allMcqData = [], allShortData = [], allEssayData = [], allFlashcards = {};
+// NOTE: allMcqData removed — MCQ now loads per-term via the manifest (see Section 1).
+let allShortData = [], allEssayData = [], allFlashcards = {};
 let currentMcqData = [], currentShortData = [], currentEssayData = [], currentFlashcardTopics = {};
 
 // --- SESSION CONTEXT ---
@@ -88,18 +308,93 @@ function parseKaeriMarkdown(text) {
 // ============================================================
 
 // ── PAYMENT CONFIGURATION & STATE (ADDED) ──
-const PAYMENT_API_URL = "https://script.google.com/macros/s/AKfycbx-XEmKaXLLionX1r0LoumRhpbzpUwliyBIImpYjBoN4VyxT2C6B5_yXWsNNwsJqHSghg/exec";
+const PAYMENT_API_URL = KAERI_CONFIG.paymentApiUrl;
 let inventory = {};
 let isSubmitting = false;
 let isChecking = false;
 
+// ────────────────────────────────────────────────────────────
+// ── MCQ MANIFEST + PER-TERM LOADER ─────────────────────────
+// ────────────────────────────────────────────────────────────
+// Term datasets self-register on `window.__MCQ__[termKey]`. The loader injects
+// the mapped file once per term, reads back the registered array, filters by
+// moderation status, and caches the result.
+
+const MCQ_MANIFEST = {
+    "BI110_T1": "assets/mcq/BI110_T1.js",
+    "BI110_T2": "assets/mcq/BI110_T2.js",
+    "BI110_T3": "assets/mcq/BI110_T3.js",
+    "CS110_T1": "assets/mcq/CS110_T1.js",
+    "CS110_T2": "assets/mcq/CS110_T2.js",
+    "CS110_T3": "assets/mcq/CS110_T3.js",
+    "CH110_T1": "assets/mcq/CH110_T1.js",
+    "CH110_T2": "assets/mcq/CH110_T2.js",
+    "CH110_T3": "assets/mcq/CH110_T3.js",
+    "PH110_T1": "assets/mcq/PH110_T1.js",
+    "PH110_T2": "assets/mcq/PH110_T2.js",
+    "PH110_T3": "assets/mcq/PH110_T3.js",
+    "MA110_T1": "assets/mcq/MA110_T1.js",
+    "MA110_T2": "assets/mcq/MA110_T2.js",
+    "MA110_T3": "assets/mcq/MA110_T3.js",
+    "LA111_T1": "assets/mcq/LA111_T1.js",
+    "LA111_T2": "assets/mcq/LA111_T2.js",
+    "LA111_T3": "assets/mcq/LA111_T3.js"
+};
+
+const _mcqCache = {};
+
+function loadMcqForTermKey(termKey) {
+    return new Promise(function (resolve) {
+        if (_mcqCache[termKey]) { resolve(_mcqCache[termKey]); return; }
+
+        const path = MCQ_MANIFEST[termKey];
+        if (!path) { _mcqCache[termKey] = []; resolve([]); return; }
+
+        const existing = document.querySelector('script[data-mcq-term="' + termKey + '"]');
+        if (existing) {
+            existing.addEventListener('load', function () { resolve(_mcqCache[termKey] || []); });
+            return;
+        }
+
+        const script = document.createElement('script');
+        script.src = path;
+        script.setAttribute('data-mcq-term', termKey);
+        script.onload = function () {
+            window.__MCQ__ = window.__MCQ__ || {};
+            const raw = window.__MCQ__[termKey] || [];
+            const usable = raw.filter(function (q) {
+                return !q.flagged && (q.status === undefined || q.status === 'approved');
+            });
+            _mcqCache[termKey] = usable;
+            resolve(usable);
+        };
+        script.onerror = function () { _mcqCache[termKey] = []; resolve([]); };
+        document.head.appendChild(script);
+    });
+}
+
+// Disable any term button whose dataset file is not yet in the manifest.
+function hideUnavailableTerms() {
+    document.querySelectorAll('.term-buttons button').forEach(function (btn) {
+        const onclick = btn.getAttribute('onclick') || '';
+        const m = onclick.match(/loadCourse\('(\w+)',\s*'(\w+)'/);
+        if (!m) return;
+        const key = m[1] + '_' + m[2];
+        if (!MCQ_MANIFEST[key]) {
+            btn.disabled = true;
+            btn.title = 'Content coming soon';
+            btn.style.opacity = '0.4';
+            btn.style.cursor = 'not-allowed';
+            if (btn.textContent.indexOf('(soon)') === -1) btn.textContent += ' (soon)';
+        }
+    });
+}
+
 function loadGlobalData() {
-    if (typeof mcqData !== 'undefined') allMcqData = mcqData; 
-    else if (typeof mcqDa !== 'undefined') allMcqData = mcqDa; 
-    else allMcqData = [];
-    
-    allShortData = typeof shortData !== 'undefined' ? shortData : [];
-    allEssayData = typeof essayData !== 'undefined' ? essayData : [];
+    // MCQ is loaded per-term via the manifest (see loadMcqForTermKey).
+    // Short Answer, Essay, and Flashcards keep their legacy global arrays.
+    allShortData  = typeof shortData  !== 'undefined' ? shortData  : [];
+    allEssayData  = typeof essayData  !== 'undefined' ? essayData  : [];
     allFlashcards = typeof flashcards !== 'undefined' ? flashcards : {};
 }
 
@@ -107,7 +402,7 @@ async function initializeCourseLogic() {
     loadGlobalData();
     
     // Initialize TTS
-    ttsEnabled = localStorage.getItem("ttsEnabled") === "true";
+    ttsEnabled = ttsSupported && localStorage.getItem("ttsEnabled") === "true";
     const modeButtonsDiv = document.querySelector('.mode-buttons');
     
     if (modeButtonsDiv) {
@@ -118,6 +413,14 @@ async function initializeCourseLogic() {
             ttsButton.onclick = toggleTTS;
             modeButtonsDiv.appendChild(ttsButton);
             updateTtsButtonText();
+        }
+        // Reader settings (voice + speed) next to the toggle
+        if (ttsSupported && !document.getElementById('tts-settings-button')) {
+            const ttsSettingsBtn = document.createElement('button');
+            ttsSettingsBtn.id = 'tts-settings-button';
+            ttsSettingsBtn.textContent = '🎛️ Reader Settings';
+            ttsSettingsBtn.onclick = openTtsSettings;
+            modeButtonsDiv.appendChild(ttsSettingsBtn);
         }
         
         // Add Progress Dashboard Button if missing
@@ -167,10 +470,10 @@ async function initializeCourseLogic() {
     currentTerm = body.getAttribute('data-term');
     currentTermKey = `${currentCourse}_${currentTerm}`;
 
-    // Filter Data
-    currentMcqData = filterDataByCourseAndTerm(allMcqData, currentCourse, currentTerm);
-    currentShortData = filterDataByCourseAndTerm(allShortData, currentCourse, currentTerm);
-    currentEssayData = filterDataByCourseAndTerm(allEssayData, currentCourse, currentTerm);
+    // Filter Data — MCQ loads per-term from the manifest; the others use legacy globals.
+    currentMcqData         = await loadMcqForTermKey(currentTermKey);
+    currentShortData       = filterDataByCourseAndTerm(allShortData, currentCourse, currentTerm);
+    currentEssayData       = filterDataByCourseAndTerm(allEssayData, currentCourse, currentTerm);
     currentFlashcardTopics = filterFlashcardsByCourseAndTerm(allFlashcards, currentCourse, currentTerm);
 
     // Inject Viewer HTML if missing
@@ -208,7 +511,6 @@ function renderMath(targetId = null) {
         if (result) renderMathInElement(result, renderOptions);
     }
 }
-
 // ============================================================
 // === 3. DOCUMENT DELIVERY ENGINE (FROM BASE A - PRESERVED) ===
 // ============================================================
@@ -309,27 +611,6 @@ function attemptOpenDoc(fileId, title) {
     }
 }
 
-// MCQ starter - initializes quiz with specified number of questions
-function startActualMcq(limit) {
-    const container = document.getElementById("quiz-form");
-    container.innerHTML = "";
-    document.getElementById("result").innerHTML = "";
-    
-    let q = shuffle([...currentMcqData]).slice(0, limit);
-    currentQuizData = q;
-    currentQuizType = 'mcq';
-    currentQuestionIndex = 0;
-    currentScore = 0;
-    
-    if (q.length === 0) {
-        container.innerHTML = "<p>No questions available.</p>";
-        updateProgress(0, 0);
-        return;
-    }
-    displayMcqQuestion();
-    logAnalyticsEvent('quiz_start', `MCQ (${limit} questions)`);
-}
-
 // Short Answer starter - initializes with specified number of questions
 function startActualShortAnswer(limit) {
     const container = document.getElementById("quiz-form");
@@ -351,41 +632,12 @@ function startActualShortAnswer(limit) {
     logAnalyticsEvent('quiz_start', `Short Answer (${limit} questions)`);
 }
 
-// Step selector for MCQ preset buttons
-function selectQuizStep(step, label) {
-    const totalAvailable = currentMcqData.length;
-    const finalCount = (step > totalAvailable) ? totalAvailable : step;
-    showAppNotification(`🎯 Starting ${finalCount} question quiz`, "success", 1500);
-    setTimeout(() => startActualMcq(finalCount), 500);
-}
-
 // Step selector for Short Answer preset buttons
 function selectShortAnswerStep(step, label) {
     const totalAvailable = currentShortData.length;
     const finalCount = (step > totalAvailable) ? totalAvailable : step;
     showAppNotification(`🎯 Starting ${finalCount} question practice`, "success", 1500);
     setTimeout(() => startActualShortAnswer(finalCount), 500);
-}
-
-// Custom number handler for MCQ
-function startCustomQuiz() {
-    const input = document.getElementById('custom-q-count');
-    if (!input) return;
-    
-    let requestedCount = parseInt(input.value);
-    const totalAvailable = currentMcqData.length;
-    
-    if (isNaN(requestedCount) || requestedCount < 1) {
-        showAppNotification("⚠️ Please enter a valid number", "warning");
-        return;
-    }
-    
-    if (requestedCount > totalAvailable) {
-        showAppNotification(`ℹ️ Only ${totalAvailable} available. Using all.`, "info", 2000);
-        requestedCount = totalAvailable;
-    }
-    
-    startActualMcq(requestedCount);
 }
 
 // Custom number handler for Short Answer
@@ -520,9 +772,9 @@ async function renderDocuments() {
         container.innerHTML = `<div style="text-align:center; padding:20px; color:#dc3545;"><h3>⚠️ Connection Error</h3><p>Could not load library.</p><button class="restart-button" onclick="renderDocuments()">Try Again</button></div>`;
     }
 }
-
 // ============================================================
 // === 4. SECURITY & AUTHENTICATION (BASE B) ===
+// === v1.1 PATCH: three-reason session check + days_remaining tiers ===
 // ============================================================
 
 async function checkAccessStatus() {
@@ -647,26 +899,43 @@ async function checkSessionStatus() {
             })
         });
         const result = await response.json();
-        if (result.success) {
-            const data = result.data;
-            // Update banner with expiry date
-            if (data.expiry_date) {
-                const expiryDate = new Date(data.expiry_date);
-                updateModeBanner(`✅ FULL ACCESS (expires ${expiryDate.toLocaleDateString()})`);
-                
-                // Show notification with days remaining
-                if (data.days_remaining !== null) {
-                    const days = data.days_remaining;
-                    if (days > 0) {
-                        showAppNotification(`ℹ️ Your license expires in ${days} day(s).`, 'info', 5000);
-                    } else if (days === 0) {
-                        showAppNotification(`⚠️ Your license expires today!`, 'warning', 7000);
-                    }
+        
+        if (!result.success) {
+            // Session invalid — generic reason from server
+            handleSessionExpired(result.message);
+            return;
+        }
+        
+        const data = result.data;
+        
+        // ── NEW: three specific reasons for invalidity, each with its own message ──
+        if (data.email_match === false) {
+            handleSessionExpired('This code belongs to a different account.');
+            return;
+        }
+        if (data.is_active === false) {
+            handleSessionExpired('Your access has been revoked.');
+            return;
+        }
+        if (data.is_expired === true) {
+            handleSessionExpired('Your subscription has expired.');
+            return;
+        }
+        
+        // Update banner with expiry date
+        if (data.expiry_date) {
+            const expiryDate = new Date(data.expiry_date);
+            updateModeBanner(`✅ FULL ACCESS (expires ${expiryDate.toLocaleDateString()})`);
+            
+            // Show notification with days remaining
+            if (data.days_remaining !== null && data.days_remaining !== undefined) {
+                const days = data.days_remaining;
+                if (days > 0) {
+                    showAppNotification(`ℹ️ Your license expires in ${days} day(s).`, 'info', 5000);
+                } else if (days === 0) {
+                    showAppNotification(`⚠️ Your license expires today!`, 'warning', 7000);
                 }
             }
-        } else {
-            // Session invalid
-            handleSessionExpired(result.message);
         }
     } catch (e) {
         console.warn('Session status check failed', e);
@@ -692,10 +961,10 @@ function handleSessionExpired(message) {
 
 function startSilentRevalidation() {
     if (revalidationInterval) clearInterval(revalidationInterval);
-    // Run every 5 minutes (300000 ms)
-    revalidationInterval = setInterval(silentRevalidation, 300000);
+    // Run every 5 minutes
+    revalidationInterval = setInterval(silentRevalidation, KAERI_CONFIG.revalidationMs);
     // Also run once immediately after a short delay
-    setTimeout(silentRevalidation, 5000);
+    setTimeout(silentRevalidation, KAERI_CONFIG.revalidationWarmupMs);
 }
 
 // ============================================================
@@ -732,7 +1001,7 @@ function blockDemo(type) {
     
     const key = `demo_${type}_used_${currentTermKey}`;
     let attempts = parseInt(localStorage.getItem(key) || "0");
-    const maxAttempts = 10;
+    const maxAttempts = KAERI_CONFIG.demoAttemptLimit;
     const attemptsLeft = maxAttempts - attempts;
     
     if (attempts < maxAttempts) {
@@ -748,6 +1017,34 @@ function blockDemo(type) {
     localStorage.setItem(key, attempts + 1);
     return false;
 }
+
+// ── Peek: has this term's demo budget for `type` any charges left? ──
+// Does NOT modify storage, does NOT notify.
+function canUseDemo(type) {
+    if (type === 'documents') return true;
+    if (hasFullAccess) return true;
+    const key = `demo_${type}_used_${currentTermKey}`;
+    const attempts = parseInt(localStorage.getItem(key) || "0");
+    return attempts < KAERI_CONFIG.demoAttemptLimit;
+}
+
+// ── Charge: consume one attempt and notify the user. ──
+// Callers must check canUseDemo() first if they want to gate the action.
+function consumeDemoAttempt(type) {
+    if (type === 'documents') return;
+    if (hasFullAccess) return;
+
+    const key = `demo_${type}_used_${currentTermKey}`;
+    const attempts = parseInt(localStorage.getItem(key) || "0");
+    const maxAttempts = KAERI_CONFIG.demoAttemptLimit;
+    const attemptsLeft = maxAttempts - attempts;
+
+    if (attemptsLeft > 0) {
+        showAppNotification(`Demo Mode: ${attemptsLeft} attempts remaining.`, "info", 2000);
+    }
+    localStorage.setItem(key, attempts + 1);
+}
+
 
 // ============================================================
 // === 5. PROGRESS TRACKING ENGINE (localStorage only) ===
@@ -1011,9 +1308,107 @@ function renderProgressDashboard() {
         </div>
     </div>`;
 }
+
 // ============================================================
 // === 5b. UI & NAVIGATION ===
+// === v1.1 PATCH: + overlay manager, shell actions, focus utilities ===
 // ============================================================
+
+// --- Overlay manager (stack-based) ---
+// Later rounds refactor existing modals (payment, print preview, doc viewer)
+// to push/pop through these; for now they're a utility available to callers.
+const overlayStack = [];
+
+function openOverlay(el, trigger) {
+    if (!el) return;
+    overlayStack.push({
+        el: el,
+        trigger: trigger || document.activeElement,
+        prevFocus: document.activeElement
+    });
+    el.classList.add('show');
+    el.setAttribute('role', 'dialog');
+    el.setAttribute('aria-modal', 'true');
+    syncBodyScroll();
+    const autofocus = el.querySelector('[data-autofocus]') || el;
+    setTimeout(function () { focusAndReveal(autofocus); }, 50);
+}
+
+function closeOverlay(el) {
+    if (!el) return;
+    const i = overlayStack.findIndex(function (o) { return o.el === el; });
+    if (i === -1) {
+        el.classList.remove('show');
+        syncBodyScroll();
+        return;
+    }
+    const entry = overlayStack.splice(i, 1)[0];
+    el.classList.remove('show');
+    syncBodyScroll();
+    if (entry.prevFocus && document.contains(entry.prevFocus)) {
+        focusAndReveal(entry.prevFocus, { behavior: 'auto' });
+    }
+}
+
+function syncBodyScroll() {
+    document.body.style.overflow = overlayStack.length > 0 ? 'hidden' : '';
+}
+
+// --- Focus utilities (reduced-motion aware) ---
+function prefersReducedMotion() {
+    return !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+}
+
+function focusAndReveal(el, opts) {
+    if (!el) return;
+    opts = opts || {};
+    try { el.focus({ preventScroll: true }); } catch (e) { try { el.focus(); } catch (e2) {} }
+    try {
+        el.scrollIntoView({
+            block: 'nearest',
+            inline: 'nearest',
+            behavior: opts.behavior || (prefersReducedMotion() ? 'auto' : 'smooth')
+        });
+    } catch (e) {}
+}
+
+function mountScreen(el) {
+    // Accessibility only: screen readers land on the new screen. Scrolling is handled by _focusScreen().
+    if (!el) return;
+    el.setAttribute('tabindex', '-1');
+    try { el.focus({ preventScroll: true }); } catch (e) {}
+}
+
+// --- Shell action bar ---
+// Renders the mode's footer buttons + an automatic "Back to Courses" chip
+// whenever a course is loaded. All existing modes keep their current buttons;
+// this is a new helper that later rounds route them through.
+function setShellActions(buttons) {
+    const bar = document.querySelector('.shell-actions');
+    if (!bar) return;
+    bar.innerHTML = '';
+
+    if (currentCourse && currentTerm) {
+        const backChip = document.createElement('button');
+        backChip.className = 'back-button';
+        backChip.innerHTML = '📚 Back to Courses';
+        backChip.onclick = function () { backToMenu(); };
+        backChip.style.background = '#2b3a55';
+        backChip.style.color = '#72efdd';
+        backChip.style.border = '1px solid #3e506e';
+        backChip.style.fontWeight = '600';
+        backChip.style.flexShrink = '0';
+        bar.appendChild(backChip);
+    }
+
+    (buttons || []).forEach(function (btn) {
+        if (!btn) return;
+        btn.style.marginTop = '0';
+        bar.appendChild(btn);
+    });
+}
+
+// --- Existing UI state handlers (unchanged) ---
 
 function enableFullAccessUI() {
     hasFullAccess = true;
@@ -1044,30 +1439,42 @@ function enableDemoUI() {
     if(priceChip) priceChip.style.display = 'block';
 }
 
-function loadCourse(course, term, price) {
+function loadCourse(course, term) {
     document.body.setAttribute('data-course', course);
     document.body.setAttribute('data-term', term);
-    currentPrice = price;
-    
-    document.getElementById('course-title').textContent = `${course} Term ${term.replace('T','')} Study Materials`;
-    document.getElementById('price-banner').textContent = `Price: K${price}`;
-    document.getElementById('price-val').textContent = `K${price}`;
-    document.getElementById('price-desc').textContent = `${course} Term ${term.replace('T','')}`;
-    
-    document.getElementById('landing-view').style.display = 'none';
-    document.getElementById('landing-header').style.display = 'none'; 
-    document.getElementById('course-view').style.display = 'block';
-    document.getElementById('fixed-header').style.display = 'block';
-    document.getElementById('price-banner').style.display = 'block';
+
+    // Prices and durations are never passed in; they always come from the live config.
+    const termLabel = String(term).replace(/^T/i, '');
+    const titleEl = document.getElementById('course-title');
+    if (titleEl) titleEl.textContent = course + ' Term ' + termLabel + ' Study Materials';
+
+    renderCourseBanner(course, term);
+    const banner = document.getElementById('price-banner');
+    if (banner) banner.style.display = 'block';
+    try { updatePlanCards(course); } catch (e) {}
+    // Deep links / slow networks: config may not be here yet. Fetch (or refresh a stale copy) and re-render.
+    loadSystemConfig().catch(function () { refreshPriceUI(); });
+    navigate({ course: course, term: term });   // Back button returns to the previous screen
+
+    const landing = document.getElementById('landing-view');
+    if (landing) landing.style.display = 'none';
+    const landH = document.getElementById('landing-header');
+    if (landH) landH.style.display = 'none';
+    const courseView = document.getElementById('course-view');
+    if (courseView) courseView.style.display = 'block';
+    const fixedH = document.getElementById('fixed-header');
+    if (fixedH) fixedH.style.display = 'block';
     document.body.classList.add('view-course');
-    window.scrollTo(0,0);
-    
-    setTimeout(() => {
-        document.getElementById('quiz-form').innerHTML = '';
-        document.getElementById('result').innerHTML = '';
+    window.scrollTo(0, 0);
+
+    setTimeout(function () {
+        const qf = document.getElementById('quiz-form');
+        const rs = document.getElementById('result');
+        if (qf) qf.innerHTML = '';
+        if (rs) rs.innerHTML = '';
         updateProgress(0, 0);
         initializeCourseLogic();
-    }, 100);
+    }, KAERI_CONFIG.courseLoadDelayMs);
 }
 
 function backToMenu() {
@@ -1118,27 +1525,32 @@ function toggleTerms(courseId) {
 // ============================================================
 // === REPLACED: openPaymentModal (with auto-load) ===
 // ============================================================
-function openPaymentModal() {
+function openPaymentModal(intent) {
     const modal = document.getElementById('payment-modal');
     if (modal) modal.classList.add('show');
-    
-    // Set course/term display
+
+    // A plan card passes { course, term }; every other caller passes nothing.
+    purchaseIntent = (intent && typeof intent.course === 'string' && typeof intent.term === 'string')
+        ? { course: _up(intent.course), term: _up(intent.term) }
+        : null;
+
+    const v = getViewedScope();
+    const c = purchaseIntent ? purchaseIntent.course : (v.course || _up(currentCourse));
+    const t = purchaseIntent ? purchaseIntent.term   : (v.term   || _up(currentTerm));
     const termName = document.getElementById('pay-term-name');
-    if (termName) termName.textContent = `${currentCourse || 'Course'} ${currentTerm || ''}`;
-    
-    // Set price display (fallback)
-    const amountEl = document.getElementById('pay-amount');
-    if (amountEl) amountEl.textContent = `K${currentPrice || 0}`;
-    
-    // Load pricing data and auto-fill the dropdowns
+    if (termName) termName.textContent = (c && t) ? payScopeLabel(c, t) : 'Choose what to unlock';
+    _showPayHeader(c, t);
+
+    // Loads (or reuses) live prices, fills the dropdowns and applies purchaseIntent.
     loadCourses();
-    
+
     // Focus the code input after a short delay
     setTimeout(() => {
         const input = document.getElementById('access-code-input');
         if(input) input.focus();
     }, 400);
 }
+
 
 // ============================================================
 // === REPLACED: closePaymentModal with idempotency reset ===
@@ -1201,22 +1613,16 @@ function clearDemoLocks() {
 }
 
 // ============================================================
-// === ADDITIVE HELPER: Show info for extra price cards (does not break existing flow) ===
-// ============================================================
-function showExtraPlanInfo(plan, price) {
-    showAppNotification(`ℹ️ ${plan} (${price}) – coming soon! For now, use "Buy Now" for single term.`, "info", 4000);
-}
-// ============================================================
 // === NEW: PAYMENT API FUNCTIONS (SERVER 3) ===
 // ============================================================
 
 function callPaymentApi(action, payload = {}, retries = 2) {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 30000);
+    const timeout = setTimeout(() => controller.abort(), KAERI_CONFIG.paymentTimeoutMs);
 
     return fetch(PAYMENT_API_URL, {
         method: 'POST',
-        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        headers: { "Content-Type": "text/plain;charset=utf-8" },
         body: JSON.stringify({ action, ...payload }),
         signal: controller.signal
     })
@@ -1228,7 +1634,7 @@ function callPaymentApi(action, payload = {}, retries = 2) {
     .catch(err => {
         clearTimeout(timeout);
         if (retries > 0) {
-            return new Promise(resolve => setTimeout(resolve, 1000))
+            return new Promise(resolve => setTimeout(resolve, KAERI_CONFIG.paymentRetryGapMs))
                 .then(() => callPaymentApi(action, payload, retries - 1));
         }
         throw err;
@@ -1246,53 +1652,106 @@ function showAlert(icon, title, text) {
     });
 }
 
+/** Amount + duration shown in the modal header. Live values only. */
+function _showPayHeader(course, term) {
+    const price = (course && term) ? getPriceFor(course, term) : null;
+    const days  = (course && term) ? getDurationFor(course, term) : null;
+    const amountEl = document.getElementById('pay-amount');
+    if (amountEl) amountEl.textContent = price === null ? '—' : 'K' + price.toFixed(2);
+    const durEl = document.getElementById('pay-duration');
+    if (durEl) durEl.textContent = (price !== null && days) ? formatDays(days) + ' of access' : '';
+}
+
+function _hasOption(select, value) {
+    return !!select && Array.prototype.some.call(select.options, function (o) { return o.value === value; });
+}
+
+/** Select a course + term in the form, synchronously (no timers, no races). */
+function selectPurchase(course, term) {
+    const cs = document.getElementById('courseSelect');
+    const ts = document.getElementById('termSelect');
+    if (!cs || !ts) return false;
+    const c = _up(course), t = _up(term);
+    if (!c || !_hasOption(cs, c)) { updatePrice(); return false; }
+    cs.value = c;
+    updateTerms();                              // rebuilds term options synchronously
+    if (t && _hasOption(ts, t)) ts.value = t;
+    updatePrice();
+    return true;
+}
+
+/** Rebuilds the form from the live config and restores what the student wants selected. */
+function renderPaymentForm() {
+    const form = document.getElementById('paymentForm');
+    if (form) form.classList.remove('hidden');
+    const cs = document.getElementById('courseSelect');
+    const ts = document.getElementById('termSelect');
+
+    // Priority: card the student just tapped → what they already picked → the course they are studying.
+    let want = null;
+    if (purchaseIntent) {
+        want = purchaseIntent;
+        purchaseIntent = null;
+    } else if (cs && cs.value) {
+        want = { course: cs.value, term: ts ? ts.value : '' };
+    } else {
+        const v = getViewedScope();
+        const c = v.course || _up(currentCourse);
+        const t = v.term || _up(currentTerm);
+        if (c) want = { course: c, term: t };
+    }
+
+    populateCourseDropdown();
+    if (want) selectPurchase(want.course, want.term);
+    updatePlanCards();
+}
+
 function loadCourses() {
     const loader = document.getElementById('init-loader');
     const form = document.getElementById('paymentForm');
-    if (!loader || !form) return;
+    if (!loader || !form) return Promise.resolve();
 
-    loader.classList.remove('hidden');
-    form.classList.add('hidden');
+    const hadCache = SYSTEM_CONFIG.loaded;
+    if (hadCache) {
+        // Instant: render from the cached config, refresh quietly behind it.
+        loader.classList.add('hidden');
+        renderPaymentForm();
+    } else {
+        loader.classList.remove('hidden');
+        form.classList.add('hidden');
+    }
 
-    callPaymentApi('getSystemConfig')
-        .then(res => {
+    return loadSystemConfig()
+        .then(function () {
             loader.classList.add('hidden');
-            if (res.success) {
-                inventory = res.inventory || {};
-                populateCourseDropdown();
-                form.classList.remove('hidden');
-
-                const courseSelect = document.getElementById('courseSelect');
-                const termSelect = document.getElementById('termSelect');
-                if (courseSelect && currentCourse) {
-                    courseSelect.value = currentCourse;
-                    updateTerms();
-                    setTimeout(() => {
-                        if (termSelect && currentTerm) {
-                            termSelect.value = currentTerm;
-                            updatePrice();
-                        }
-                    }, 50);
-                }
-            } else {
-                showAlert('error', 'Connection Error', res.message || 'Could not load courses.');
-            }
+            renderPaymentForm();
         })
-        .catch(() => {
+        .catch(function (err) {
             loader.classList.add('hidden');
-            showAlert('error', 'Network Error', 'Could not reach the server.');
+            if (!hadCache) {
+                showAlert('error', 'Connection Error', (err && err.message && err.message !== 'Failed to fetch')
+                    ? err.message : 'Could not reach the server. Check your connection and try again.');
+            }
         });
+}
+
+function _courseOrder(keys) {
+    // Real courses alphabetically, the Global entry (ALL) last.
+    return keys.slice().sort(function (a, b) {
+        if (a === 'ALL') return 1;
+        if (b === 'ALL') return -1;
+        return a < b ? -1 : (a > b ? 1 : 0);
+    });
 }
 
 function populateCourseDropdown() {
     const courseSelect = document.getElementById('courseSelect');
     if (!courseSelect) return;
-    const courses = Object.keys(inventory);
     courseSelect.innerHTML = '<option value="" disabled selected>Select Course...</option>';
-    courses.forEach(code => {
+    _courseOrder(Object.keys(inventory || {})).forEach(code => {
         const opt = document.createElement('option');
         opt.value = code;
-        opt.textContent = code;
+        opt.textContent = code === 'ALL' ? 'Global Access (all courses)' : code;
         courseSelect.appendChild(opt);
     });
     const termSelect = document.getElementById('termSelect');
@@ -1305,38 +1764,57 @@ function populateCourseDropdown() {
 
 function updateTerms() {
     const course = document.getElementById('courseSelect')?.value;
-    const terms = inventory[course] || {};
+    const terms = (inventory && inventory[course]) || {};
     const termSelect = document.getElementById('termSelect');
     if (!termSelect) return;
     termSelect.innerHTML = '<option value="" disabled selected>Select Term...</option>';
     termSelect.disabled = true;
-    const termKeys = Object.keys(terms).sort();
+    const termKeys = _courseOrder(Object.keys(terms));
     if (termKeys.length === 0) {
-        termSelect.innerHTML = '<option value="" disabled>No terms</option>';
+        termSelect.innerHTML = '<option value="" disabled selected>No terms</option>';
         updatePrice();
         return;
     }
     termKeys.forEach(t => {
         const opt = document.createElement('option');
         opt.value = t;
-        opt.textContent = t;
+        opt.textContent = (t === 'ALL') ? (course === 'ALL' ? 'All courses & terms' : 'All terms (Full Course)') : t;
         termSelect.appendChild(opt);
     });
     termSelect.disabled = false;
+    if (termKeys.length === 1) termSelect.value = termKeys[0];   // e.g. Global Access has only one choice
     updatePrice();
 }
 
+/** One function renders every price/duration line in the modal. Live values only. */
 function updatePrice() {
     const course = document.getElementById('courseSelect')?.value;
     const term = document.getElementById('termSelect')?.value;
     const display = document.getElementById('priceDisplay');
-    if (!display) return;
-    if (course && term && inventory[course] && inventory[course][term] !== undefined) {
-        display.textContent = 'K' + inventory[course][term].toFixed(2);
+    const durDisplay = document.getElementById('durationDisplay');
+
+    const ready = !!(course && term);
+    const price = ready ? getPriceFor(course, term) : null;
+    const days  = ready ? getDurationFor(course, term) : null;
+
+    if (display) display.textContent = price !== null ? 'K' + price.toFixed(2) : 'K0.00';
+    if (durDisplay) durDisplay.textContent = (price !== null && days) ? formatDays(days) + ' (starts on first use)' : '—';
+    const devices = ready ? getMaxDevicesFor(course, term) : null;
+    const devRow = document.getElementById('devicesRow');
+    const devEl = document.getElementById('devicesDisplay');
+    if (devRow) devRow.style.display = (price !== null && devices) ? 'flex' : 'none';
+    if (devEl) devEl.textContent = devices ? devices + (devices === 1 ? ' device' : ' devices') : '—';
+
+    if (ready) {
+        const termName = document.getElementById('pay-term-name');
+        if (termName) termName.textContent = payScopeLabel(course, term);
+        _showPayHeader(course, term);
     } else {
-        display.textContent = 'K0.00';
+        _showPayHeader('', '');
     }
+    updatePlanCards();
 }
+
 
 function handleFile(input) {
     const fileName = document.getElementById('fileName');
@@ -1345,7 +1823,7 @@ function handleFile(input) {
 
     if (input.files && input.files.length > 0) {
         const file = input.files[0];
-        const maxSize = 5 * 1024 * 1024;
+        const maxSize = KAERI_CONFIG.maxPaymentScreenshotBytes;
         if (file.size > maxSize) {
             showAlert('warning', 'File Too Large', 'Please upload an image smaller than 5MB.');
             input.value = '';
@@ -1406,7 +1884,7 @@ function handleSubmit() {
             screenshotBase64: evt.target.result
         };
 
-        callPaymentApi('submitPayment', { payload }, 3)
+        callPaymentApi('submitPayment', { payload }, KAERI_CONFIG.paymentRetries)
             .then(res => {
                 if (res.success) {
                     showAlert('success', 'Submitted!', res.message || 'Payment submitted successfully! Verification takes ~24 hours.')
@@ -1579,130 +2057,958 @@ function switchPayTab(tab) {
         if (statusView) statusView.classList.remove('hidden');
     }
 }
-
 // ============================================================
 // === 6. QUIZ ENGINE with Tiered Access ===
+// === v1.1 PATCH: paid MCQ wizard (3 screens) — demo contract untouched ===
+// === v1.3 PATCH: demo MCQ bulk-select picker (multi-select sub-topics),
+//                 fixed 10 questions/run, shuffle forced ON ===
+// === v1.6 PATCH: naturalSort applied to unit and sub-topic ordering ===
 // ============================================================
 
-function renderQuiz() {
-    // FREE USER: Fixed at 10 questions
-    if (!hasFullAccess) {
-        if (blockDemo('mcq')) return;
-        startActualMcq(10);
-        return;
-    }
-    
-    // PAID USER: Show setup screen with preset buttons
-    const container = document.getElementById("quiz-form");
-    const totalAvailable = currentMcqData.length;
-    
-    if (totalAvailable <= 5) {
-        startActualMcq(totalAvailable);
-        return;
-    }
-    
-    const steps = [5, 10, 20, 30, 40, 50, totalAvailable];
-    const stepLabels = ['5', '10', '20', '30', '40', '50', 'ALL'];
-    
-    container.innerHTML = `
-        <div style="background:#1e2a3a; padding:30px; border-radius:15px; border:2px solid #72efdd; text-align:center; max-width:450px; margin:20px auto;">
-            <h2 style="color:white; margin-bottom:10px;">⚙️ Premium Quiz Setup</h2>
-            <p style="color:#a0a8b4; margin-bottom:20px;">Choose your challenge size</p>
-            
-            <div style="margin:30px 0;">
-                <div style="display:flex; flex-wrap:wrap; gap:8px; justify-content:center; margin:20px 0;">
-                    ${steps.map((step, index) => `
-                        <button onclick="selectQuizStep(${step}, '${stepLabels[index]}')" 
-                            style="flex:1; min-width:45px; background:${step === 10 ? '#28a745' : '#2b3a55'}; 
-                                   color:white; border:none; padding:12px 8px; border-radius:8px; 
-                                   font-weight:bold; cursor:pointer;">
-                            ${stepLabels[index]}
-                        </button>
-                    `).join('')}
-                </div>
-                
-                <div style="margin-top:25px; padding-top:20px; border-top:1px solid #3e506e;">
-                    <p style="color:#a0a8b4; margin-bottom:10px;">Or custom number:</p>
-                    <div style="display:flex; gap:10px;">
-                        <input type="number" id="custom-q-count" min="1" max="${totalAvailable}" value="10" 
-                               style="flex:2; padding:12px; border-radius:8px; border:1px solid #3e506e; 
-                                      background:#0d1b2a; color:white;">
-                        <button onclick="startCustomQuiz()" 
-                                style="flex:1; background:#007bff; color:white; border:none; 
-                                       padding:12px; border-radius:8px; font-weight:bold; cursor:pointer;">
-                            Go
-                        </button>
-                    </div>
-                </div>
-                
-                <div style="margin-top:20px; color:#72efdd; background:#0d1b2a; padding:10px; border-radius:6px;">
-                    📊 ${totalAvailable} questions available
-                </div>
-            </div>
-            
-            <div style="margin-top:20px;">
-                <button onclick="exitQuiz()" class="back-button" style="margin-top:0;">⬅️ Back</button>
-            </div>
-        </div>
-    `;
+// ────────────────────────────────────────────────────────────
+// ── MCQ wizard state (paid only; demo never touches it) ────
+// ────────────────────────────────────────────────────────────
+const mcqSetupState = {
+    selectedUnits:  new Set(),
+    selectedSubs:   {},          // { unitName: Set<subName> }
+    orderedUnits:   [],          // sequence of units to walk through
+    subScreenIndex: 0,
+    count:          10,
+    shuffleQs:      true,
+    shuffleOpts:    true,
+    groupByTopic:   false
+};
+
+// ────────────────────────────────────────────────────────────
+// ── Demo MCQ picker state (bulk-select, resets on course change)
+// ────────────────────────────────────────────────────────────
+const _demoMcqState = {
+    step:               'unit',              // 'unit' | 'sub'
+    selectedUnit:       null,                // single unit context when in 'sub' step
+    selectedSubsByUnit: {}                   // { unitName: Set<subName> } — persists across unit switches
+};
+
+function resetMcqWizardState() {
+    mcqSetupState.selectedUnits.clear();
+    mcqSetupState.selectedSubs   = {};
+    mcqSetupState.orderedUnits   = [];
+    mcqSetupState.subScreenIndex = 0;
+    mcqSetupState.count          = 10;
+    mcqSetupState.shuffleQs      = true;
+    mcqSetupState.shuffleOpts    = true;
+    mcqSetupState.groupByTopic   = false;
+
+    _demoMcqState.step               = 'unit';
+    _demoMcqState.selectedUnit       = null;
+    _demoMcqState.selectedSubsByUnit = {};
 }
 
+// ────────────────────────────────────────────────────────────
+// ── Topic index — group questions by mainTopic + topic ─────
+// ────────────────────────────────────────────────────────────
+function buildMcqTopicIndex(questions) {
+    const index = {};
+    for (const q of questions) {
+        const unit = q.mainTopic || 'Ungrouped';
+        const sub  = q.topic     || 'General';
+        if (!index[unit]) index[unit] = {};
+        if (!index[unit][sub]) index[unit][sub] = [];
+        index[unit][sub].push(q);
+    }
+    return index;
+}
+
+// Escape a string for inline onclick use (only \\ and ')
+function _escInline(s) {
+    return String(s).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+}
+
+// Read how many demo attempts remain for this term.
+function _demoAttemptsLeft() {
+    const key = 'demo_mcq_used_' + currentTermKey;
+    const used = parseInt(localStorage.getItem(key) || '0');
+    return Math.max(0, KAERI_CONFIG.demoAttemptLimit - used);
+}
+
+// ────────────────────────────────────────────────────────────
+// ── Entry point (unchanged name — HTML depends on it) ──────
+// ────────────────────────────────────────────────────────────
+function renderQuiz() {
+    // FREE USER: peek only — do NOT consume. Consumption happens on Start.
+    if (!hasFullAccess) {
+        if (!canUseDemo('mcq')) {
+            showAppNotification('Demo limit reached. Unlock Full Access!', 'warning');
+            openPaymentModal();
+            return;
+        }
+        renderDemoMcqPicker();
+        return;
+    }
+
+    // PAID USER: three-screen wizard.
+    renderMcqMenu();
+}
+
+// ────────────────────────────────────────────────────────────
+// ── Demo picker router — chooses which step to render ──────
+// ────────────────────────────────────────────────────────────
+function renderDemoMcqPicker() {
+    if (!currentMcqData || currentMcqData.length === 0) {
+        const container = document.getElementById('quiz-form');
+        container.innerHTML = '<div style="text-align:center;padding:40px 20px;">'
+            + '<h3>📭 No questions yet</h3>'
+            + '<p style="color:#a0a8b4;">No MCQ content for ' + currentCourse + ' ' + currentTerm + '.</p>'
+            + '</div>';
+        return;
+    }
+
+    const tree  = buildMcqTopicIndex(currentMcqData);
+    const units = Object.keys(tree).sort(naturalSort);
+
+    // Reset step context only — keep selectedSubsByUnit so Try Again / unit switches persist picks.
+    _demoMcqState.selectedUnit = null;
+
+    // If the term has only one unit, skip the unit step.
+    if (units.length === 1) {
+        _demoMcqState.selectedUnit = units[0];
+        _demoMcqState.step         = 'sub';
+        renderDemoSubPicker(units[0]);
+        return;
+    }
+
+    _demoMcqState.step = 'unit';
+    renderDemoUnitPicker();
+}
+
+// ────────────────────────────────────────────────────────────
+// ── Demo step 1 — unit picker (only if term has > 1 unit) ──
+// ────────────────────────────────────────────────────────────
+function renderDemoUnitPicker() {
+    const container = document.getElementById('quiz-form');
+    container.innerHTML = '';
+    document.getElementById('result').innerHTML = '';
+    currentQuizType = 'mcqDemoUnit';
+    updateProgress(0, 0);
+
+    const tree  = buildMcqTopicIndex(currentMcqData);
+    const units = Object.keys(tree).sort(naturalSort);
+    const attemptsLeft = _demoAttemptsLeft();
+
+    let html = '<div style="max-width:560px;margin:0 auto;">'
+        + _mcqPoolBannerHtml()
+        + '<div style="text-align:center;margin-bottom:22px;">'
+        + '<h2 style="color:white;margin:0 0 4px 0;">📚 Choose a Unit</h2>'
+        + '<p style="color:#a0a8b4;font-size:0.85em;margin:0;">'
+        + currentCourse + ' ' + currentTerm + ' · ' + units.length + ' units · ' + currentMcqData.length + ' questions'
+        + '</p></div>'
+        + '<div style="text-align:center;margin-bottom:16px;color:#ffc107;font-size:0.82em;'
+        + 'background:#0d1b2a;border:1px solid #3e506e;border-radius:6px;padding:8px;">'
+        + '🔒 Demo Mode: <strong>' + attemptsLeft + ' attempt' + (attemptsLeft === 1 ? '' : 's') + '</strong> remaining'
+        + '</div>'
+        + '<div>';
+
+    units.forEach(function (u) {
+        const subs = Object.keys(tree[u]);
+        const qCount = subs.reduce(function (s, k) { return s + tree[u][k].length; }, 0);
+        const safeU = _escInline(u);
+
+        // Badge: how many sub-topics ticked in this unit
+        const pickedSet = _demoMcqState.selectedSubsByUnit[u];
+        const pickedCount = pickedSet ? pickedSet.size : 0;
+        const badge = pickedCount > 0
+            ? '<div style="font-size:0.72em;color:#72efdd;font-weight:700;'
+              + 'background:#0d1b2a;padding:2px 8px;border-radius:10px;display:inline-block;margin-top:4px;">'
+              + '● ' + pickedCount + ' selected</div>'
+            : '';
+
+        html += '<div class="demo-mcq-unit-row" '
+            + 'onclick="demoSelectUnit(\'' + safeU + '\')" '
+            + 'style="background:#1e2a3a;border:2px solid ' + (pickedCount > 0 ? '#28a745' : '#2b3a55') + ';'
+            + 'border-radius:10px;padding:16px;margin-bottom:10px;cursor:pointer;transition:0.2s;">'
+            + '<div style="display:flex;align-items:center;gap:12px;">'
+            + '<div style="flex:1;">'
+            + '<div style="color:white;font-size:1em;font-weight:600;line-height:1.3;">' + u + '</div>'
+            + '<div style="color:#a0a8b4;font-size:0.78em;margin-top:3px;">'
+            + subs.length + ' sub-topics · ' + qCount + ' questions</div>'
+            + badge
+            + '</div>'
+            + '<div style="color:#72efdd;font-size:1.2em;font-weight:700;">→</div>'
+            + '</div></div>';
+    });
+
+    html += '</div>'
+        + '<button type="button" onclick="exitQuiz()" class="back-button" '
+        + 'style="width:100%;margin:16px 0 0 0;">⬅️ Back to Menu</button>'
+        + '</div>';
+
+    container.innerHTML = html;
+}
+
+function demoSelectUnit(unit) {
+    _demoMcqState.selectedUnit = unit;
+    _demoMcqState.step         = 'sub';
+
+    // Do NOT reset subs for this unit — keep any prior selections.
+    if (!_demoMcqState.selectedSubsByUnit[unit]) {
+        _demoMcqState.selectedSubsByUnit[unit] = new Set();
+    }
+
+    renderDemoSubPicker(unit);
+}
+
+// ────────────────────────────────────────────────────────────
+// ── Demo step 2 — bulk-select sub-topic picker ─────────────
+// ────────────────────────────────────────────────────────────
+// UX: checkboxes instead of radios. User can pick any combination.
+// Run length is fixed at 10 (or fewer if the pool is smaller).
+// Shuffle is forced ON as an operator default.
+function renderDemoSubPicker(unit) {
+    const container = document.getElementById('quiz-form');
+    container.innerHTML = '';
+    document.getElementById('result').innerHTML = '';
+    currentQuizType = 'mcqDemoSub';
+    updateProgress(0, 0);
+
+    const tree  = buildMcqTopicIndex(currentMcqData);
+    const subs  = Object.keys(tree[unit] || {}).sort(naturalSort);
+    const units = Object.keys(tree).sort(naturalSort);
+    const multiUnit = units.length > 1;
+    const attemptsLeft = _demoAttemptsLeft();
+    const safeU = _escInline(unit);
+
+    // Read this unit's persistent selection (defaults to empty Set)
+    const selectedSubs = _demoMcqState.selectedSubsByUnit[unit] || new Set();
+
+    let html = '<div style="max-width:560px;margin:0 auto;">'
+        + (multiUnit ? '' : _mcqPoolBannerHtml())
+        + '<div style="text-align:center;margin-bottom:20px;">';
+
+    if (multiUnit) {
+        html += '<div style="color:#a0a8b4;font-size:0.8em;letter-spacing:1px;'
+            + 'text-transform:uppercase;margin-bottom:6px;">'
+            + '<span onclick="renderDemoUnitPicker()" style="cursor:pointer;color:#72efdd;">← All units</span>'
+            + '</div>';
+    }
+
+    html += '<h2 style="color:white;margin:0 0 4px 0;">📖 ' + unit + '</h2>'
+        + '<p style="color:#a0a8b4;font-size:0.85em;margin:0;">'
+        + subs.length + ' sub-topics · pick any combination'
+        + '</p></div>'
+        + '<div style="text-align:center;margin-bottom:16px;color:#ffc107;font-size:0.82em;'
+        + 'background:#0d1b2a;border:1px solid #3e506e;border-radius:6px;padding:8px;">'
+        + '🔒 Demo Mode: <strong>' + attemptsLeft + ' attempt' + (attemptsLeft === 1 ? '' : 's') + '</strong> remaining'
+        + '</div>'
+        + '<div id="demo-mcq-sub-list">';
+
+    subs.forEach(function (sub) {
+        const qCount = tree[unit][sub].length;
+        const isSelected = selectedSubs.has(sub);
+        const safeS = _escInline(sub);
+        html += '<div class="demo-mcq-sub-row" data-unit="' + safeU + '" data-sub="' + safeS + '" '
+            + 'onclick="demoToggleSub(\'' + safeS + '\')" '
+            + 'style="background:#1e2a3a;border:2px solid ' + (isSelected ? '#28a745' : '#2b3a55') + ';'
+            + 'border-radius:10px;padding:14px 16px;margin-bottom:10px;display:flex;align-items:center;gap:14px;cursor:pointer;">'
+            + '<div class="demo-mcq-cb" style="width:18px;height:18px;border-radius:4px;border:2px solid '
+                + (isSelected ? '#28a745' : '#3e506e') + ';background:'
+                + (isSelected ? '#28a745' : 'transparent') + ';flex-shrink:0;display:flex;align-items:center;justify-content:center;font-size:0.75em;color:white;font-weight:900;">'
+                + (isSelected ? '✓' : '')
+            + '</div>'
+            + '<div style="flex:1;">'
+            + '<div style="color:white;font-size:0.95em;font-weight:600;">' + sub + '</div>'
+            + '<div style="color:#a0a8b4;font-size:0.75em;margin-top:2px;">' + qCount + ' question' + (qCount === 1 ? '' : 's') + '</div>'
+            + '</div>'
+            + '</div>';
+    });
+
+    html += '</div>'
+        + '<div style="display:flex;gap:8px;margin:14px 0;">'
+        + '<button type="button" onclick="demoSelectAllSubs(true)" style="flex:1;background:#2b3a55;color:#72efdd;border:1px solid #3e506e;padding:10px;border-radius:8px;font-weight:600;cursor:pointer;margin:0;">✓ All</button>'
+        + '<button type="button" onclick="demoSelectAllSubs(false)" style="flex:1;background:#2b3a55;color:#a0a8b4;border:1px solid #3e506e;padding:10px;border-radius:8px;font-weight:600;cursor:pointer;margin:0;">✗ None</button>'
+        + '</div>'
+        + '<div id="demo-mcq-summary" style="background:#0d1b2a;border:1px solid #3e506e;'
+            + 'border-radius:8px;padding:12px;text-align:center;color:#a0a8b4;font-size:0.88em;'
+            + 'margin:16px 0;"></div>'
+        + '<button type="button" id="demo-mcq-start" onclick="startDemoSubTopicMcq()" '
+            + 'style="width:100%;background:#28a745;color:white;border:none;padding:14px;'
+            + 'border-radius:8px;font-weight:700;font-size:1em;margin:0 0 12px 0;'
+            + 'opacity:0.5;cursor:not-allowed;" disabled>'
+            + '▶️ Select sub-topics above</button>'
+        + '<div style="background:#0d1b2a;border:1px dashed #ffc107;border-radius:8px;'
+            + 'padding:12px 14px;text-align:center;font-size:0.82em;color:#a0a8b4;line-height:1.5;">'
+            + '<span style="color:#ffc107;font-weight:700;">🔓 Unlock to set question counts, '
+            + 'control shuffling, and group by sub-topic</span>'
+            + '</div>'
+        + '<button type="button" onclick="exitQuiz()" class="back-button" '
+            + 'style="width:100%;margin:12px 0 0 0;">⬅️ Back to Menu</button>'
+        + '</div>';
+
+    container.innerHTML = html;
+    _updateDemoMcqSummary();
+}
+
+function demoToggleSub(sub) {
+    const unit = _demoMcqState.selectedUnit;
+    if (!_demoMcqState.selectedSubsByUnit[unit]) {
+        _demoMcqState.selectedSubsByUnit[unit] = new Set();
+    }
+    const set = _demoMcqState.selectedSubsByUnit[unit];
+
+    if (set.has(sub)) set.delete(sub);
+    else              set.add(sub);
+
+    document.querySelectorAll('.demo-mcq-sub-row').forEach(function (row) {
+        const isSelected = set.has(row.dataset.sub);
+        row.style.border = isSelected ? '2px solid #28a745' : '2px solid #2b3a55';
+        const cb = row.querySelector('.demo-mcq-cb');
+        if (cb) {
+            cb.style.border     = isSelected ? '2px solid #28a745' : '2px solid #3e506e';
+            cb.style.background = isSelected ? '#28a745' : 'transparent';
+            cb.textContent      = isSelected ? '✓' : '';
+        }
+    });
+    _updateDemoMcqSummary();
+}
+
+function demoSelectAllSubs(selectAll) {
+    const tree = buildMcqTopicIndex(currentMcqData);
+    const unit = _demoMcqState.selectedUnit;
+    const subs = Object.keys(tree[unit] || {});
+
+    _demoMcqState.selectedSubsByUnit[unit] = selectAll ? new Set(subs) : new Set();
+    const set = _demoMcqState.selectedSubsByUnit[unit];
+
+    document.querySelectorAll('.demo-mcq-sub-row').forEach(function (row) {
+        const isSelected = set.has(row.dataset.sub);
+        row.style.border = isSelected ? '2px solid #28a745' : '2px solid #2b3a55';
+        const cb = row.querySelector('.demo-mcq-cb');
+        if (cb) {
+            cb.style.border     = isSelected ? '2px solid #28a745' : '2px solid #3e506e';
+            cb.style.background = isSelected ? '#28a745' : 'transparent';
+            cb.textContent      = isSelected ? '✓' : '';
+        }
+    });
+    _updateDemoMcqSummary();
+}
+
+// Honest summary — real pool count, real run count, operator-fixed 10.
+function _updateDemoMcqSummary() {
+    const el  = document.getElementById('demo-mcq-summary');
+    const btn = document.getElementById('demo-mcq-start');
+    if (!el || !btn) return;
+
+    const unit = _demoMcqState.selectedUnit;
+    const set  = _demoMcqState.selectedSubsByUnit[unit] || new Set();
+
+    if (!unit || set.size === 0) {
+        el.innerHTML = 'Select one or more sub-topics to begin';
+        btn.disabled = true;
+        btn.style.opacity = '0.5';
+        btn.style.cursor = 'not-allowed';
+        btn.textContent = '▶️ Select sub-topics above';
+        return;
+    }
+
+    const tree = buildMcqTopicIndex(currentMcqData);
+    let poolSize = 0;
+    set.forEach(function (sub) {
+        poolSize += ((tree[unit] && tree[unit][sub]) || []).length;
+    });
+
+    const runCount = Math.min(10, poolSize);
+
+    el.innerHTML = '<strong style="color:#72efdd;">' + runCount + '</strong> question'
+        + (runCount === 1 ? '' : 's')
+        + ' from <strong style="color:#72efdd;">' + set.size + '</strong> sub-topic'
+        + (set.size === 1 ? '' : 's')
+        + ' <span style="color:#a0a8b4;">(of ' + poolSize + ' available)</span>';
+
+    btn.disabled = false;
+    btn.style.opacity = '1';
+    btn.style.cursor = 'pointer';
+    btn.textContent = '▶️ Start ' + runCount + '-question quiz';
+}
+
+function startDemoSubTopicMcq() {
+    const unit = _demoMcqState.selectedUnit;
+    const set  = unit ? _demoMcqState.selectedSubsByUnit[unit] : null;
+
+    if (!unit || !set || set.size === 0) {
+        showAppNotification('⚠️ Select at least one sub-topic', 'warning');
+        return;
+    }
+
+    // ── CHARGE POINT — the moment of no return. ──
+    if (!hasFullAccess) {
+        if (!canUseDemo('mcq')) {
+            showAppNotification('Demo limit reached. Unlock Full Access!', 'warning');
+            openPaymentModal();
+            return;
+        }
+        consumeDemoAttempt('mcq');
+    }
+
+    const tree = buildMcqTopicIndex(currentMcqData);
+    const demoState = {
+        selectedUnits: new Set([unit]),
+        selectedSubs:  { [unit]: new Set(set) },
+        count:         10,
+        shuffleQs:     true,
+        shuffleOpts:   true,
+        groupByTopic:  false
+    };
+    const opts = { shuffleQs: true, shuffleOpts: true, groupByTopic: false };
+
+    const questions = buildMcqQuiz(tree, demoState, opts);
+    if (questions.length === 0) {
+        showAppNotification('⚠️ Could not build quiz', 'warning');
+        return;
+    }
+
+    currentQuizData      = questions;
+    currentQuizType      = 'mcq';
+    currentQuestionIndex = 0;
+    currentScore         = 0;
+    isSubmissionLocked   = false;
+
+    logAnalyticsEvent('quiz_start',
+        'MCQ DEMO · ' + set.size + ' sub-topics · ' + questions.length + 'Q');
+
+    document.getElementById('result').innerHTML = '';
+    displayMcqQuestion();
+}
+
+// ────────────────────────────────────────────────────────────
+// ── Paid wizard screen 1: main topics ──────────────────────
+// ────────────────────────────────────────────────────────────
+function renderMcqMenu() {
+    const container = document.getElementById('quiz-form');
+    container.innerHTML = '';
+    document.getElementById('result').innerHTML = '';
+    currentQuizType = 'mcqMenu';
+    updateProgress(0, 0);
+
+    if (!currentMcqData || currentMcqData.length === 0) {
+        container.innerHTML = '<div style="text-align:center;padding:40px 20px;">'
+            + '<h3>📭 No questions yet</h3>'
+            + '<p style="color:#a0a8b4;">No MCQ content for ' + currentCourse + ' ' + currentTerm + '.</p>'
+            + '</div>';
+        return;
+    }
+
+    const tree  = buildMcqTopicIndex(currentMcqData);
+    const units = Object.keys(tree).sort(naturalSort);
+
+    if (mcqSetupState.selectedUnits.size === 0 && mcqSetupState.orderedUnits.length === 0) {
+        units.forEach(function (u) {
+            mcqSetupState.selectedUnits.add(u);
+            mcqSetupState.selectedSubs[u] = new Set(Object.keys(tree[u]));
+        });
+        mcqSetupState.orderedUnits = units.slice();
+    } else {
+        Array.from(mcqSetupState.selectedUnits).forEach(function (u) {
+            if (!tree[u]) {
+                mcqSetupState.selectedUnits.delete(u);
+                delete mcqSetupState.selectedSubs[u];
+            }
+        });
+        Object.keys(mcqSetupState.selectedSubs).forEach(function (u) {
+            if (!tree[u]) { delete mcqSetupState.selectedSubs[u]; return; }
+            const validSubs = new Set(Object.keys(tree[u]));
+            const current = mcqSetupState.selectedSubs[u];
+            if (!current) return;
+            Array.from(current).forEach(function (s) { if (!validSubs.has(s)) current.delete(s); });
+        });
+    }
+
+    let html = '<div style="max-width:560px;margin:0 auto;">'
+        + _mcqPoolBannerHtml()
+        + '<div style="text-align:center;margin-bottom:22px;">'
+        + '<h2 style="color:white;margin:0 0 4px 0;">📚 Select Main Topic</h2>'
+        + '<p style="color:#a0a8b4;font-size:0.85em;margin:0;">'
+        + currentCourse + ' ' + currentTerm + ' · ' + currentMcqData.length + ' questions · ' + units.length + ' units'
+        + '</p></div><div id="mcq-unit-list">';
+
+    units.forEach(function (u) {
+        const subs = Object.keys(tree[u]);
+        const qCount = subs.reduce(function (s, k) { return s + tree[u][k].length; }, 0);
+        const checked = mcqSetupState.selectedUnits.has(u);
+        const ratio = mcqSetupState.selectedSubs[u] ? mcqSetupState.selectedSubs[u].size / subs.length : 0;
+        const cbState = (!checked || ratio === 0) ? 'unchecked' : (ratio === 1) ? 'checked' : 'partial';
+        const safeU = _escInline(u);
+
+        html += '<div class="mcq-unit-row" style="background:#1e2a3a;border:2px solid ' + (cbState === 'unchecked' ? '#2b3a55' : '#28a745') + ';border-radius:10px;padding:14px 16px;margin-bottom:10px;display:flex;align-items:center;gap:14px;cursor:pointer;">'
+            + '<input type="checkbox" class="mcq-unit-cb" data-unit="' + safeU + '" ' + (cbState === 'checked' ? 'checked' : '') + (cbState === 'partial' ? ' data-partial="1"' : '') + ' onclick="event.stopPropagation(); mcqMenuToggleUnit(\'' + safeU + '\', this.checked)" style="transform:scale(1.3);accent-color:#72efdd;cursor:pointer;flex-shrink:0;">'
+            + '<div style="flex:1;" onclick="mcqMenuDrillUnit(\'' + safeU + '\')">'
+            + '<div style="color:white;font-size:1em;font-weight:600;line-height:1.3;">' + u + '</div>'
+            + '<div style="color:#a0a8b4;font-size:0.78em;margin-top:3px;">' + subs.length + ' sub-topics · ' + qCount + ' questions</div>'
+            + '</div>'
+            + '<div style="color:#72efdd;font-size:1.2em;font-weight:700;" onclick="mcqMenuDrillUnit(\'' + safeU + '\')">→</div>'
+            + '</div>';
+    });
+
+    html += '</div>'
+        + '<div style="display:flex;gap:8px;margin:18px 0;">'
+        + '<button type="button" onclick="mcqMenuSelectAllUnits(true)" style="flex:1;background:#2b3a55;color:#72efdd;border:1px solid #3e506e;padding:10px;border-radius:8px;font-weight:600;cursor:pointer;margin:0;">✓ All</button>'
+        + '<button type="button" onclick="mcqMenuSelectAllUnits(false)" style="flex:1;background:#2b3a55;color:#a0a8b4;border:1px solid #3e506e;padding:10px;border-radius:8px;font-weight:600;cursor:pointer;margin:0;">✗ None</button>'
+        + '</div>'
+        + '<div id="mcq-menu-summary" style="background:#0d1b2a;border:1px solid #3e506e;border-radius:8px;padding:12px;text-align:center;color:#a0a8b4;font-size:0.88em;margin-bottom:16px;"></div>'
+        + '<button type="button" onclick="mcqMenuContinue()" style="width:100%;background:#28a745;color:white;border:none;padding:14px;border-radius:8px;font-weight:700;font-size:1em;cursor:pointer;margin:0 0 8px 0;">Continue →</button>'
+        + '<button type="button" onclick="exitQuiz()" class="back-button" style="width:100%;margin:0;">⬅️ Back to Menu</button>'
+        + '</div>';
+
+    container.innerHTML = html;
+    mcqMenuUpdateSummary(tree);
+}
+
+function mcqMenuToggleUnit(unit, checked) {
+    const tree = buildMcqTopicIndex(currentMcqData);
+    if (checked) {
+        mcqSetupState.selectedUnits.add(unit);
+        if (!mcqSetupState.selectedSubs[unit]) {
+            mcqSetupState.selectedSubs[unit] = new Set(Object.keys(tree[unit] || {}));
+        }
+    } else {
+        mcqSetupState.selectedUnits.delete(unit);
+        delete mcqSetupState.selectedSubs[unit];
+    }
+    renderMcqMenu();
+}
+
+function mcqMenuSelectAllUnits(checked) {
+    const tree = buildMcqTopicIndex(currentMcqData);
+    if (checked) {
+        Object.keys(tree).forEach(function (u) {
+            mcqSetupState.selectedUnits.add(u);
+            mcqSetupState.selectedSubs[u] = new Set(Object.keys(tree[u]));
+        });
+    } else {
+        mcqSetupState.selectedUnits.clear();
+        mcqSetupState.selectedSubs = {};
+    }
+    renderMcqMenu();
+}
+
+function mcqMenuUpdateSummary(tree) {
+    const el = document.getElementById('mcq-menu-summary');
+    if (!el) return;
+    let subCount = 0;
+    let qCount = 0;
+    mcqSetupState.selectedUnits.forEach(function (u) {
+        const subs = mcqSetupState.selectedSubs[u];
+        if (!subs) return;
+        subCount += subs.size;
+        subs.forEach(function (s) { qCount += ((tree[u] && tree[u][s]) || []).length; });
+    });
+    if (mcqSetupState.selectedUnits.size === 0) {
+        el.innerHTML = 'No units selected';
+    } else {
+        el.innerHTML = '<strong style="color:#72efdd;">' + mcqSetupState.selectedUnits.size + '</strong> units · '
+            + '<strong style="color:#72efdd;">' + subCount + '</strong> sub-topics · '
+            + '<strong style="color:#72efdd;">' + qCount + '</strong> questions';
+    }
+}
+
+function mcqMenuDrillUnit(unit) {
+    const tree = buildMcqTopicIndex(currentMcqData);
+    const subs = Object.keys(tree[unit] || {}).sort(naturalSort);
+    if (subs.length === 0) {
+        showAppNotification("No sub-topics in this unit.", "info");
+        return;
+    }
+    if (!mcqSetupState.selectedUnits.has(unit)) {
+        mcqSetupState.selectedUnits.add(unit);
+        mcqSetupState.selectedSubs[unit] = new Set(subs);
+    }
+    mcqSetupState.orderedUnits = [unit].concat(
+        Array.from(mcqSetupState.selectedUnits).filter(function (u) { return u !== unit; })
+    );
+    mcqSetupState.subScreenIndex = 0;
+    renderMcqSubTopicMenu();
+}
+
+function mcqMenuContinue() {
+    if (mcqSetupState.selectedUnits.size === 0) {
+        showAppNotification("⚠️ Select at least one unit", "warning");
+        return;
+    }
+    mcqSetupState.orderedUnits = Array.from(mcqSetupState.selectedUnits).sort(naturalSort);
+    mcqSetupState.subScreenIndex = 0;
+    renderMcqSubTopicMenu();
+}
+
+// ────────────────────────────────────────────────────────────
+// ── Paid wizard screen 2: sub-topics per unit ──────────────
+// ────────────────────────────────────────────────────────────
+function renderMcqSubTopicMenu() {
+    const container = document.getElementById('quiz-form');
+    container.innerHTML = '';
+    document.getElementById('result').innerHTML = '';
+    currentQuizType = 'mcqSubMenu';
+    updateProgress(0, 0);
+
+    const tree = buildMcqTopicIndex(currentMcqData);
+    const unit = mcqSetupState.orderedUnits[mcqSetupState.subScreenIndex];
+    if (!unit) { renderMcqSetupScreen(); return; }
+
+    const subs = Object.keys(tree[unit] || {}).sort(naturalSort);
+    const selectedSubs = mcqSetupState.selectedSubs[unit] || new Set();
+    const totalInUnit  = subs.reduce(function (s, k) { return s + tree[unit][k].length; }, 0);
+    const totalSteps   = mcqSetupState.orderedUnits.length;
+    const safeU        = _escInline(unit);
+
+    let html = '<div style="max-width:560px;margin:0 auto;">'
+        + '<div style="text-align:center;margin-bottom:22px;">'
+        + '<div style="color:#a0a8b4;font-size:0.8em;letter-spacing:1px;text-transform:uppercase;margin-bottom:6px;">Unit ' + (mcqSetupState.subScreenIndex + 1) + ' of ' + totalSteps + '</div>'
+        + '<h2 style="color:white;margin:0 0 4px 0;">📖 ' + unit + '</h2>'
+        + '<p style="color:#a0a8b4;font-size:0.85em;margin:0;">Choose sub-topics · ' + subs.length + ' available · ' + totalInUnit + ' questions</p>'
+        + '</div><div id="mcq-sub-list">';
+
+    subs.forEach(function (sub) {
+        const qCount = tree[unit][sub].length;
+        const checked = selectedSubs.has(sub);
+        const safeS = _escInline(sub);
+        html += '<div class="mcq-sub-row" style="background:#1e2a3a;border:2px solid ' + (checked ? '#28a745' : '#2b3a55') + ';border-radius:10px;padding:14px 16px;margin-bottom:10px;display:flex;align-items:center;gap:14px;cursor:pointer;">'
+            + '<input type="checkbox" class="mcq-sub-cb" data-unit="' + safeU + '" data-sub="' + safeS + '" data-count="' + qCount + '" ' + (checked ? 'checked' : '') + ' onclick="event.stopPropagation(); mcqSubToggle(\'' + safeU + '\', \'' + safeS + '\', this.checked)" style="transform:scale(1.3);accent-color:#72efdd;cursor:pointer;flex-shrink:0;">'
+            + '<div style="flex:1;" onclick="mcqSubToggle(\'' + safeU + '\', \'' + safeS + '\', !this.parentElement.querySelector(\'input\').checked)">'
+            + '<div style="color:white;font-size:0.95em;font-weight:600;">' + sub + '</div>'
+            + '<div style="color:#a0a8b4;font-size:0.75em;margin-top:2px;">' + qCount + ' questions</div>'
+            + '</div></div>';
+    });
+
+    html += '</div>'
+        + '<div style="display:flex;gap:8px;margin:18px 0;">'
+        + '<button type="button" onclick="mcqSubSelectAll(\'' + safeU + '\', true)" style="flex:1;background:#2b3a55;color:#72efdd;border:1px solid #3e506e;padding:10px;border-radius:8px;font-weight:600;cursor:pointer;margin:0;">✓ All</button>'
+        + '<button type="button" onclick="mcqSubSelectAll(\'' + safeU + '\', false)" style="flex:1;background:#2b3a55;color:#a0a8b4;border:1px solid #3e506e;padding:10px;border-radius:8px;font-weight:600;cursor:pointer;margin:0;">✗ None</button>'
+        + '</div>'
+        + '<div id="mcq-sub-summary" style="background:#0d1b2a;border:1px solid #3e506e;border-radius:8px;padding:12px;text-align:center;color:#a0a8b4;font-size:0.88em;margin-bottom:16px;"></div>'
+        + '<div style="display:flex;gap:8px;">'
+        + '<button type="button" onclick="mcqSubBack()" style="flex:1;background:#2b3a55;color:white;border:1px solid #3e506e;padding:14px;border-radius:8px;font-weight:700;cursor:pointer;margin:0;">← Back</button>'
+        + '<button type="button" onclick="mcqSubContinue()" style="flex:2;background:#28a745;color:white;border:none;padding:14px;border-radius:8px;font-weight:700;cursor:pointer;margin:0;">Continue →</button>'
+        + '</div>'
+        + '</div>';
+
+    container.innerHTML = html;
+    mcqSubUpdateSummary(unit);
+}
+
+function mcqSubToggle(unit, sub, checked) {
+    if (!mcqSetupState.selectedSubs[unit]) mcqSetupState.selectedSubs[unit] = new Set();
+    if (checked) mcqSetupState.selectedSubs[unit].add(sub);
+    else mcqSetupState.selectedSubs[unit].delete(sub);
+    document.querySelectorAll('.mcq-sub-row').forEach(function (row) {
+        const cb = row.querySelector('input');
+        if (!cb) return;
+        row.style.border = cb.checked ? '2px solid #28a745' : '2px solid #2b3a55';
+    });
+    mcqSubUpdateSummary(unit);
+}
+
+function mcqSubSelectAll(unit, checked) {
+    const tree = buildMcqTopicIndex(currentMcqData);
+    if (checked) mcqSetupState.selectedSubs[unit] = new Set(Object.keys(tree[unit]));
+    else mcqSetupState.selectedSubs[unit] = new Set();
+    renderMcqSubTopicMenu();
+}
+
+function mcqSubUpdateSummary(unit) {
+    const el = document.getElementById('mcq-sub-summary');
+    if (!el) return;
+    const tree = buildMcqTopicIndex(currentMcqData);
+    const subs = mcqSetupState.selectedSubs[unit] || new Set();
+    let qCount = 0;
+    subs.forEach(function (s) { qCount += ((tree[unit] && tree[unit][s]) || []).length; });
+    if (subs.size === 0) {
+        el.innerHTML = 'No sub-topics selected in this unit';
+    } else {
+        el.innerHTML = '<strong style="color:#72efdd;">' + subs.size + '</strong> of '
+            + Object.keys(tree[unit]).length + ' sub-topics · '
+            + '<strong style="color:#72efdd;">' + qCount + '</strong> questions';
+    }
+}
+
+function mcqSubBack() {
+    if (mcqSetupState.subScreenIndex > 0) {
+        mcqSetupState.subScreenIndex--;
+        renderMcqSubTopicMenu();
+    } else {
+        renderMcqMenu();
+    }
+}
+
+function mcqSubContinue() {
+    const unit = mcqSetupState.orderedUnits[mcqSetupState.subScreenIndex];
+    const subs = mcqSetupState.selectedSubs[unit];
+
+    if (!subs || subs.size === 0) {
+        const proceed = confirm('No sub-topics selected in ' + unit + '.\n\nSkip this unit?');
+        if (!proceed) return;
+        mcqSetupState.selectedUnits.delete(unit);
+        const idx = mcqSetupState.orderedUnits.indexOf(unit);
+        if (idx > -1) mcqSetupState.orderedUnits.splice(idx, 1);
+        if (mcqSetupState.subScreenIndex >= mcqSetupState.orderedUnits.length) {
+            renderMcqSetupScreen();
+        } else {
+            renderMcqSubTopicMenu();
+        }
+        return;
+    }
+
+    mcqSetupState.subScreenIndex++;
+    if (mcqSetupState.subScreenIndex >= mcqSetupState.orderedUnits.length) {
+        renderMcqSetupScreen();
+    } else {
+        renderMcqSubTopicMenu();
+    }
+}
+
+// ────────────────────────────────────────────────────────────
+// ── Paid wizard screen 3: count + shuffle options ──────────
+// ────────────────────────────────────────────────────────────
+function renderMcqSetupScreen() {
+    const container = document.getElementById('quiz-form');
+    container.innerHTML = '';
+    document.getElementById('result').innerHTML = '';
+    currentQuizType = 'mcqSetup';
+    updateProgress(0, 0);
+
+    const tree = buildMcqTopicIndex(currentMcqData);
+
+    let poolSize = 0;
+    mcqSetupState.selectedUnits.forEach(function (u) {
+        const subs = mcqSetupState.selectedSubs[u];
+        if (!subs) return;
+        subs.forEach(function (s) { poolSize += ((tree[u] && tree[u][s]) || []).length; });
+    });
+
+    if (poolSize === 0) {
+        container.innerHTML = '<div style="text-align:center;padding:40px 20px;">'
+            + '<h3>⚠️ No questions selected</h3>'
+            + '<p style="color:#a0a8b4;">Nothing to quiz on with the current selection.</p>'
+            + '<button class="restart-button" onclick="renderMcqMenu()" style="margin-top:12px;">← Back to topics</button>'
+            + '</div>';
+        return;
+    }
+
+    if (mcqSetupState.count > poolSize) mcqSetupState.count = poolSize;
+    if (mcqSetupState.count < 1) mcqSetupState.count = Math.min(10, poolSize);
+
+    const presets = [5, 10, 20, 30, 50].filter(function (n) { return n <= poolSize; });
+
+    let html = '<div style="max-width:560px;margin:0 auto;">'
+        + '<div style="text-align:center;margin-bottom:22px;">'
+        + '<h2 style="color:white;margin:0 0 4px 0;">⚙️ Quiz Setup</h2>'
+        + '<p style="color:#a0a8b4;font-size:0.85em;margin:0;">' + mcqSetupState.selectedUnits.size + ' units · ' + poolSize + ' questions available</p>'
+        + '</div>'
+        + '<div style="background:#1e2a3a;border:1px solid #2b3a55;border-radius:10px;padding:16px;margin-bottom:16px;">'
+        + '<div style="font-size:0.78em;color:#a0a8b4;text-transform:uppercase;letter-spacing:0.8px;margin-bottom:12px;">Number of Questions</div>'
+        + '<div style="display:flex;flex-wrap:wrap;gap:8px;justify-content:center;margin-bottom:12px;">'
+        + presets.map(function (n) {
+            return '<button type="button" onclick="mcqSetCount(' + n + ')" data-preset="' + n + '" style="flex:1;min-width:52px;background:' + (n === mcqSetupState.count ? '#28a745' : '#2b3a55') + ';color:white;border:none;padding:10px 8px;border-radius:8px;font-weight:700;cursor:pointer;margin:0;font-size:0.9em;">' + n + '</button>';
+        }).join('')
+        + '<button type="button" onclick="mcqSetCount(' + poolSize + ')" data-preset="' + poolSize + '" style="flex:1;min-width:52px;background:' + (poolSize === mcqSetupState.count ? '#28a745' : '#2b3a55') + ';color:' + (poolSize === mcqSetupState.count ? 'white' : '#ffc107') + ';border:none;padding:10px 8px;border-radius:8px;font-weight:700;cursor:pointer;margin:0;font-size:0.9em;">ALL</button>'
+        + '</div>'
+        + '<input type="number" id="mcq-count-input" value="' + mcqSetupState.count + '" min="1" max="' + poolSize + '" oninput="mcqOnCustomCount(this.value)" style="width:100%;padding:10px;border-radius:8px;border:1px solid #3e506e;background:#0d1b2a;color:white;box-sizing:border-box;text-align:center;font-size:0.95em;">'
+        + '</div>'
+        + '<div style="background:#1e2a3a;border:1px solid #2b3a55;border-radius:10px;padding:16px;margin-bottom:20px;">'
+        + '<div style="font-size:0.78em;color:#a0a8b4;text-transform:uppercase;letter-spacing:0.8px;margin-bottom:10px;">Shuffling</div>'
+        + '<label style="display:flex;align-items:center;justify-content:space-between;padding:8px 0;cursor:pointer;">'
+        + '<span style="color:#e0e6ed;font-size:0.9em;">🔀 Shuffle question order</span>'
+        + '<input type="checkbox" ' + (mcqSetupState.shuffleQs ? 'checked' : '') + ' onchange="mcqSetupState.shuffleQs = this.checked" style="transform:scale(1.2);accent-color:#72efdd;"></label>'
+        + '<label style="display:flex;align-items:center;justify-content:space-between;padding:8px 0;border-top:1px solid #2b3a55;cursor:pointer;">'
+        + '<span style="color:#e0e6ed;font-size:0.9em;">🔀 Shuffle answer choices</span>'
+        + '<input type="checkbox" ' + (mcqSetupState.shuffleOpts ? 'checked' : '') + ' onchange="mcqSetupState.shuffleOpts = this.checked" style="transform:scale(1.2);accent-color:#72efdd;"></label>'
+        + '<label style="display:flex;align-items:center;justify-content:space-between;padding:8px 0;border-top:1px solid #2b3a55;cursor:pointer;">'
+        + '<span style="color:#e0e6ed;font-size:0.9em;">🌱 Keep questions grouped by sub-topic</span>'
+        + '<input type="checkbox" ' + (mcqSetupState.groupByTopic ? 'checked' : '') + ' onchange="mcqSetupState.groupByTopic = this.checked" style="transform:scale(1.2);accent-color:#72efdd;"></label>'
+        + '</div>'
+        + '<div style="display:flex;gap:8px;">'
+        + '<button type="button" onclick="mcqSubBack()" style="flex:1;background:#2b3a55;color:white;border:1px solid #3e506e;padding:14px;border-radius:8px;font-weight:700;cursor:pointer;margin:0;">⬅ Back</button>'
+        + '<button type="button" onclick="startSelectedMcq()" style="flex:2;background:#28a745;color:white;border:none;padding:14px;border-radius:8px;font-weight:700;cursor:pointer;margin:0;">🚀 Start Quiz</button>'
+        + '</div>'
+        + '</div>';
+
+    container.innerHTML = html;
+}
+
+function mcqSetCount(n) {
+    mcqSetupState.count = n;
+    const input = document.getElementById('mcq-count-input');
+    if (input) input.value = n;
+    document.querySelectorAll('#quiz-form button[data-preset]').forEach(function (b) {
+        const isActive = parseInt(b.dataset.preset) === n;
+        const isAll = b.textContent.trim() === 'ALL';
+        b.style.background = isActive ? '#28a745' : '#2b3a55';
+        b.style.color = isActive ? 'white' : (isAll ? '#ffc107' : 'white');
+    });
+}
+
+function mcqOnCustomCount(value) {
+    const n = parseInt(value);
+    if (!isNaN(n) && n > 0) mcqSetupState.count = n;
+    document.querySelectorAll('#quiz-form button[data-preset]').forEach(function (b) {
+        b.style.background = '#2b3a55';
+        b.style.color = b.textContent.trim() === 'ALL' ? '#ffc107' : 'white';
+    });
+}
+
+// ────────────────────────────────────────────────────────────
+// ── Pure question picker ───────────────────────────────────
+// ────────────────────────────────────────────────────────────
+function buildMcqQuiz(tree, state, opts) {
+    const shuffleQs = opts.shuffleQs;
+    const shuffleOpts = opts.shuffleOpts;
+    const groupByTopic = opts.groupByTopic;
+
+    let pool = [];
+    state.selectedUnits.forEach(function (unit) {
+        const subs = state.selectedSubs[unit];
+        if (!subs) return;
+        subs.forEach(function (sub) {
+            const bucket = (tree[unit] && tree[unit][sub]) || [];
+            pool.push.apply(pool, bucket);
+        });
+    });
+    if (pool.length === 0) return [];
+
+    if (groupByTopic) {
+        const groups = {};
+        const groupKeys = [];
+        pool.forEach(function (q) {
+            const k = (q.mainTopic || 'Ungrouped') + '::' + (q.topic || 'General');
+            if (!groups[k]) { groups[k] = []; groupKeys.push(k); }
+            groups[k].push(q);
+        });
+        const orderedGroups = groupKeys.map(function (k) { return groups[k]; });
+        if (shuffleQs) orderedGroups.forEach(function (g) { shuffle(g); });
+
+        const targetCount = Math.max(1, parseInt(state.count) || 10);
+        pool = [];
+        let i = 0;
+        while (pool.length < targetCount) {
+            let added = false;
+            for (const g of orderedGroups) {
+                if (i < g.length) {
+                    pool.push(g[i]);
+                    added = true;
+                    if (pool.length >= targetCount) break;
+                }
+            }
+            if (!added) break;
+            i++;
+        }
+    } else if (shuffleQs) {
+        shuffle(pool);
+    }
+
+    let count = parseInt(state.count) || 10;
+    if (count > pool.length) count = pool.length;
+    if (count < 1) count = 1;
+
+    let picked = pool.slice(0, count);
+
+    picked = picked.map(function (q) {
+        return shuffleOpts ? shuffleQuestionOptions(q) : Object.assign({}, q);
+    });
+
+    return picked;
+}
+
+function startSelectedMcq() {
+    const tree = buildMcqTopicIndex(currentMcqData);
+    const opts = {
+        shuffleQs:    mcqSetupState.shuffleQs,
+        shuffleOpts:  mcqSetupState.shuffleOpts,
+        groupByTopic: mcqSetupState.groupByTopic
+    };
+
+    let poolSize = 0;
+    mcqSetupState.selectedUnits.forEach(function (u) {
+        const subs = mcqSetupState.selectedSubs[u];
+        if (!subs) return;
+        subs.forEach(function (s) { poolSize += ((tree[u] && tree[u][s]) || []).length; });
+    });
+
+    const requested = parseInt(mcqSetupState.count) || 10;
+    if (requested > poolSize) {
+        showAppNotification('ℹ️ Only ' + poolSize + ' available. Using all.', "info", 2000);
+    }
+
+    const questions = buildMcqQuiz(tree, mcqSetupState, opts);
+    if (questions.length === 0) {
+        showAppNotification("⚠️ No questions match your selection", "warning");
+        return;
+    }
+
+    currentQuizData      = questions;
+    currentQuizType      = 'mcq';
+    currentQuestionIndex = 0;
+    currentScore         = 0;
+    isSubmissionLocked   = false;
+
+    logAnalyticsEvent('quiz_start',
+        'MCQ · ' + mcqSetupState.selectedUnits.size + ' units · ' + questions.length + 'Q');
+
+    document.getElementById("result").innerHTML = "";
+    displayMcqQuestion();
+}
+
+// ────────────────────────────────────────────────────────────
+// ── Short Answer entry (demo contract unchanged) ────────────
+// ────────────────────────────────────────────────────────────
 function renderShortAnswers() {
-    // FREE USER: Fixed at 10 questions
     if (!hasFullAccess) {
         if (blockDemo('shortAnswer')) return;
         startActualShortAnswer(10);
         return;
     }
-    
-    // PAID USER: Show setup screen with preset buttons
+
     const totalAvailable = currentShortData.length;
-    
+
     if (totalAvailable <= 5) {
         startActualShortAnswer(totalAvailable);
         return;
     }
-    
+
     const container = document.getElementById("quiz-form");
     const steps = [5, 10, 20, 30, 40, 50, totalAvailable];
     const stepLabels = ['5', '10', '20', '30', '40', '50', 'ALL'];
-    
+
     container.innerHTML = `
         <div style="background:#1e2a3a; padding:30px; border-radius:15px; border:2px solid #ffc107; text-align:center; max-width:450px; margin:20px auto;">
             <h2 style="color:white; margin-bottom:10px;">✍️ Premium Short Answer Setup</h2>
             <p style="color:#a0a8b4; margin-bottom:20px;">Choose your practice size</p>
-            
+
             <div style="margin:30px 0;">
                 <div style="display:flex; flex-wrap:wrap; gap:8px; justify-content:center; margin:20px 0;">
                     ${steps.map((step, index) => `
-                        <button onclick="selectShortAnswerStep(${step}, '${stepLabels[index]}')" 
-                            style="flex:1; min-width:45px; background:${step === 10 ? '#28a745' : '#2b3a55'}; 
-                                   color:white; border:none; padding:12px 8px; border-radius:8px; 
+                        <button onclick="selectShortAnswerStep(${step}, '${stepLabels[index]}')"
+                            style="flex:1; min-width:45px; background:${step === 10 ? '#28a745' : '#2b3a55'};
+                                   color:white; border:none; padding:12px 8px; border-radius:8px;
                                    font-weight:bold; cursor:pointer;">
                             ${stepLabels[index]}
                         </button>
                     `).join('')}
                 </div>
-                
+
                 <div style="margin-top:25px; padding-top:20px; border-top:1px solid #3e506e;">
                     <p style="color:#a0a8b4; margin-bottom:10px;">Custom number:</p>
                     <div style="display:flex; gap:10px;">
-                        <input type="number" id="custom-sa-count" min="1" max="${totalAvailable}" value="10" 
-                               style="flex:2; padding:12px; border-radius:8px; border:1px solid #3e506e; 
+                        <input type="number" id="custom-sa-count" min="1" max="${totalAvailable}" value="10"
+                               style="flex:2; padding:12px; border-radius:8px; border:1px solid #3e506e;
                                       background:#0d1b2a; color:white;">
-                        <button onclick="startCustomShortAnswer()" 
-                                style="flex:1; background:#007bff; color:white; border:none; 
+                        <button onclick="startCustomShortAnswer()"
+                                style="flex:1; background:#007bff; color:white; border:none;
                                        padding:12px; border-radius:8px; font-weight:bold; cursor:pointer;">
                             Go
                         </button>
                     </div>
                 </div>
-                
+
                 <div style="margin-top:20px; color:#ffc107; background:#0d1b2a; padding:10px; border-radius:6px;">
                     📚 ${totalAvailable} questions available
                 </div>
             </div>
-            
+
             <div style="margin-top:20px;">
                 <button onclick="exitQuiz()" class="back-button" style="margin-top:0;">⬅️ Back</button>
             </div>
@@ -1763,9 +3069,11 @@ function checkMcqAnswer() {
         currentScore++;
         resultDiv.innerHTML = "<p>✔️ Correct!</p>";
         feedbackText = "Correct!";
+        try { recordMcqAnswer(q, true); } catch (e) {}
     } else {
         resultDiv.innerHTML = `<p>❌ Correct: ${String.fromCharCode(65 + q.correct)}. ${parseKaeriMarkdown(q.options[q.correct])}</p>`;
         feedbackText = `Wrong. The correct answer is option ${String.fromCharCode(65 + q.correct)}.`;
+        try { recordMcqAnswer(q, false); } catch (e) {}
     }
     
     const explanationBox = `<div class="explanation-box">${parseKaeriMarkdown(q.explanation || '')}</div>`;
@@ -1774,7 +3082,6 @@ function checkMcqAnswer() {
     
     currentQuestionIndex++;
 
-    // ── CHANGE 1: On last question, Finish button skips straight to final card ──
     const isLastMcq = currentQuestionIndex >= currentQuizData.length;
     const nextBtn = document.createElement("button");
     nextBtn.innerText = isLastMcq ? "Finish Quiz" : "Next ➡️";
@@ -1809,6 +3116,20 @@ function showFinalMcqScore() {
     challengeBtn.onclick = () => challengeFriend(currentScore, currentQuizData.length, "MCQ");
     container.appendChild(challengeBtn);
 
+    try {
+        const poolN = getMcqWrongPool().length;
+        if (poolN > 0) {
+            const poolBtn = document.createElement("button");
+            poolBtn.type = "button";
+            poolBtn.innerText = "🔁 Practice " + poolN + " to fix";
+            poolBtn.style.backgroundColor = "#6610f2";
+            poolBtn.style.color = "white";
+            poolBtn.style.marginLeft = "10px";
+            poolBtn.onclick = startMcqWrongPoolPractice;
+            container.appendChild(poolBtn);
+        }
+    } catch (e) {}
+
     const previewBtn = document.createElement("button");
     previewBtn.innerText = "👁️ Preview & Print";
     previewBtn.style.backgroundColor = "#007bff"; 
@@ -1817,7 +3138,6 @@ function showFinalMcqScore() {
     previewBtn.onclick = generatePrintPreview;
     container.appendChild(previewBtn);
 
-    // ── CHANGE 2: Switch learning modality panel ──
     const switchDiv = document.createElement("div");
     switchDiv.style.cssText = "margin-top:30px; padding:18px; background:#0d1b2a; border-radius:12px; border:1px solid #3e506e; text-align:center;";
     switchDiv.innerHTML = `
@@ -1830,9 +3150,7 @@ function showFinalMcqScore() {
     `;
     container.appendChild(switchDiv);
 
-    // Record local progress
     recordProgressSession('mcq', currentScore, currentQuizData.length, `${currentCourse} ${currentTerm} MCQ`);
-    // Log analytics
     logAnalyticsEvent('quiz_complete', `MCQ score: ${currentScore}/${currentQuizData.length} (${percent}%)`);
 }
 
@@ -1889,7 +3207,6 @@ function checkShortAnswer() {
     
     currentQuestionIndex++;
 
-    // ── CHANGE 1: On last question, Finish button skips straight to final card ──
     const isLastSA = currentQuestionIndex >= currentQuizData.length;
     const nextBtn = document.createElement("button");
     nextBtn.innerText = isLastSA ? "Finish" : "Next ➡️";
@@ -1932,7 +3249,6 @@ function showFinalShortAnswerScore() {
     previewBtn.onclick = generatePrintPreview;
     container.appendChild(previewBtn);
 
-    // ── CHANGE 2: Switch learning modality panel ──
     const switchDiv = document.createElement("div");
     switchDiv.style.cssText = "margin-top:30px; padding:18px; background:#0d1b2a; border-radius:12px; border:1px solid #3e506e; text-align:center;";
     switchDiv.innerHTML = `
@@ -2058,7 +3374,6 @@ function checkEssayStep() {
     resultDiv.innerHTML += explanationBox;
     feedbackText += ` Explanation: ${humanizeLaTeX(step.explanation || '')}`;
 
-    // ── CHANGE 1: On last step, Finish button skips straight to final card ──
     const isLastStep = currentStepIndex >= essay.steps.length - 1;
     const nextBtn = document.createElement("button");
     nextBtn.innerText = isLastStep ? "Finish" : "Next ➡️";
@@ -2114,7 +3429,6 @@ function showFinalEssayScore() {
     backBtn.onclick = renderEssaySimulation;
     container.appendChild(backBtn);
 
-    // ── CHANGE 2: Switch learning modality panel ──
     const switchDiv = document.createElement("div");
     switchDiv.style.cssText = "margin-top:30px; padding:18px; background:#0d1b2a; border-radius:12px; border:1px solid #3e506e; text-align:center;";
     switchDiv.innerHTML = `
@@ -2130,6 +3444,7 @@ function showFinalEssayScore() {
     recordProgressSession('essay', essayScore, currentEssay.steps.length, currentEssay.title);
     logAnalyticsEvent('essay_complete', `${currentEssay.title} score: ${essayScore}/${currentEssay.steps.length} (${percent}%)`);
 }
+
 
 // ============================================================
 // === 7. SRS ENGINE (SPACED REPETITION - SM-2 ALGORITHM) ===
@@ -2189,6 +3504,231 @@ function calculateNextReview(topic, cardIndex, quality) {
     saveCardSRS(topic, cardIndex, card);
     return card;
 }
+
+
+// ============================================================
+// === 7b. MCQ WRONG-ANSWER POOL (replaces MCQ SRS) ===
+// ============================================================
+// Flashcards keep SM-2 (Section 7). MCQs use an honest pool:
+//   • a question enters "to fix" when answered wrong
+//   • it leaves after MCQ_MASTERY_STREAK correct answers in a row
+//   • answered right but not yet mastered (and never missed) = "building"
+//   • never answered = "new"
+// Right and wrong answers are both counted, so correct work shows up immediately.
+// Records are small ({w,s,c,a,t}) and keyed by a hash of the question, per term:
+//   w = times wrong, s = current right-in-a-row, c = times right, a = attempts, t = last seen
+
+const MCQ_MASTERY_STREAK = 3;
+
+function _mcqPoolKey() {
+    return 'kaeri_pool_v1_' + (currentTermKey || 'global');
+}
+
+function _hashStr(s) {
+    let h = 2166136261;
+    for (let i = 0; i < s.length; i++) {
+        h ^= s.charCodeAt(i);
+        h = Math.imul(h, 16777619);
+    }
+    return (h >>> 0).toString(36);
+}
+
+/** Stable id for a question (works for shuffled copies too). */
+function _mcqItemId(q) {
+    if (!q) return '';
+    const base = (q.id != null && String(q.id) !== '')
+        ? 'id:' + q.id
+        : (q.mainTopic || '') + '#' + (q.topic || '') + '#' + String(q.q || q.question || '');
+    return base ? _hashStr(base) : '';
+}
+
+function _loadMcqPool() {
+    let store = null;
+    try {
+        const raw = localStorage.getItem(_mcqPoolKey());
+        if (raw) store = JSON.parse(raw);
+    } catch (e) { store = null; }
+    if (store && typeof store === 'object' && !Array.isArray(store)) return store;
+
+    // First run for this term: carry over the previous "missed questions" list, if any.
+    store = {};
+    try {
+        const legacyKey = 'kaeri_mcq_wrong_' + (currentTermKey || 'global');
+        const raw = localStorage.getItem(legacyKey);
+        if (raw) {
+            const legacy = JSON.parse(raw);
+            if (Array.isArray(legacy)) {
+                legacy.forEach(function (lq) {
+                    const id = _mcqItemId(lq);
+                    if (id) store[id] = { w: 1, s: 0, c: 0, a: 1, t: Date.now() };
+                });
+            }
+            localStorage.removeItem(legacyKey);
+            _saveMcqPool(store);
+        }
+    } catch (e) {}
+    return store;
+}
+
+function _saveMcqPool(store) {
+    try { localStorage.setItem(_mcqPoolKey(), JSON.stringify(store || {})); } catch (e) { /* quota */ }
+}
+
+/** Call once per answered MCQ. */
+function recordMcqAnswer(q, wasCorrect) {
+    const id = _mcqItemId(q);
+    if (!id) return;
+    const store = _loadMcqPool();
+    const rec = store[id] || { w: 0, s: 0, c: 0, a: 0, t: 0 };
+    const prevC = (rec.c != null) ? rec.c : (rec.s || 0);   // older records: streak is the best count we have
+    rec.t = Date.now();
+    rec.a = (rec.a || 0) + 1;
+    if (wasCorrect) {
+        rec.s = (rec.s || 0) + 1;
+        rec.c = prevC + 1;
+    } else {
+        rec.w = (rec.w || 0) + 1;
+        rec.s = 0;
+        rec.c = prevC;
+    }
+    store[id] = rec;
+    _saveMcqPool(store);
+}
+
+function _isToFix(rec) { return !!rec && (rec.w || 0) > 0 && (rec.s || 0) < MCQ_MASTERY_STREAK; }
+
+/**
+ * Honest numbers for the current term.
+ * toFix + building + mastered + fresh = total questions.
+ * right / wrong = answers recorded so far (so correct work is visible, not only mistakes).
+ */
+function computeMcqPoolCounts() {
+    const store = _loadMcqPool();
+    let toFix = 0, building = 0, mastered = 0, fresh = 0, right = 0, wrong = 0;
+    (currentMcqData || []).forEach(function (q) {
+        const rec = store[_mcqItemId(q)];
+        if (!rec) { fresh++; return; }
+        const w = rec.w || 0, s = rec.s || 0;
+        const c = (rec.c != null) ? rec.c : s;
+        right += c; wrong += w;
+        if (s >= MCQ_MASTERY_STREAK) mastered++;
+        else if (w > 0) toFix++;
+        else if (c > 0) building++;
+        else fresh++;
+    });
+    return { toFix: toFix, building: building, mastered: mastered, fresh: fresh, right: right, wrong: wrong, attempts: right + wrong };
+}
+
+/** Questions currently in the pool (array of question objects). */
+function getMcqWrongPool() {
+    const store = _loadMcqPool();
+    return (currentMcqData || []).filter(function (q) { return _isToFix(store[_mcqItemId(q)]); });
+}
+
+/** Wipes the tracking for this term (called after the student confirms in the reset dialog). */
+function clearMcqWrongPool() {
+    try {
+        localStorage.removeItem(_mcqPoolKey());
+        localStorage.removeItem('kaeri_mcq_wrong_' + (currentTermKey || 'global'));
+    } catch (e) {}
+}
+
+function startWrongPoolQuiz() {
+    const pool = getMcqWrongPool();
+    if (!pool.length) {
+        showAppNotification('🎉 Nothing to fix. Try new questions!', 'success', 2500);
+        return;
+    }
+    // Free users: a pool session uses a demo attempt, same as any other MCQ run.
+    if (!hasFullAccess) {
+        if (!canUseDemo('mcq')) {
+            showAppNotification('Demo limit reached. Unlock Full Access!', 'warning');
+            openPaymentModal();
+            return;
+        }
+        consumeDemoAttempt('mcq');
+    }
+    const container = document.getElementById('quiz-form');
+    if (container) container.innerHTML = '';
+    const result = document.getElementById('result');
+    if (result) result.innerHTML = '';
+
+    currentQuizData = shuffle(pool.map(shuffleQuestionOptions));
+    currentQuizType = 'mcq';
+    currentQuestionIndex = 0;
+    currentScore = 0;
+    isSubmissionLocked = false;
+    logAnalyticsEvent('quiz_start', 'MCQ POOL · ' + currentQuizData.length + 'Q');
+    displayMcqQuestion();
+}
+function startMcqWrongPoolPractice() { startWrongPoolQuiz(); }
+
+/** Banner shown at the top of the MCQ menus. */
+function _mcqPoolBannerHtml() {
+    if (!currentMcqData || currentMcqData.length === 0) return '';
+    let c;
+    try { c = computeMcqPoolCounts(); } catch (e) { return ''; }
+    const num = function (n, color) { return '<strong style="color:' + color + ';">' + n + '</strong>'; };
+    const allDone = c.toFix === 0 && c.building === 0 && c.fresh === 0;
+    const pct = c.attempts > 0 ? Math.round((c.right / c.attempts) * 100) : 0;
+
+    return '<div id="mcq-pool-banner" style="background:#1e2a3a;border:1px solid #2b3a55;border-radius:10px;padding:14px;margin-bottom:16px;">'
+        + '<div style="text-align:center;color:#e0e6ed;font-size:0.95em;">'
+        + (allDone
+            ? '🏆 All ' + num(c.mastered, '#28a745') + ' questions mastered!'
+            : '<div style="display:flex;flex-wrap:wrap;gap:4px 14px;justify-content:center;">'
+              + '<span>🎯 ' + num(c.toFix, '#ef4444') + ' to fix</span>'
+              + '<span>📈 ' + num(c.building, '#ffc107') + ' building</span>'
+              + '<span>✅ ' + num(c.mastered, '#28a745') + ' mastered</span>'
+              + '<span>✨ ' + num(c.fresh, '#72efdd') + ' new</span>'
+              + '</div>')
+        + '</div>'
+        + (c.attempts > 0
+            ? '<div style="text-align:center;color:#a0a8b4;font-size:0.82em;margin-top:8px;">'
+              + '✔ ' + num(c.right, '#28a745') + ' right · ✖ ' + num(c.wrong, '#ef4444') + ' wrong · ' + pct + '% accuracy</div>'
+            : '')
+        + ((c.toFix > 0 || c.building > 0)
+            ? '<div style="text-align:center;color:#6c7a90;font-size:0.74em;margin-top:6px;">Get a question right ' + MCQ_MASTERY_STREAK + ' times in a row to master it.</div>'
+            : '')
+        + (c.toFix > 0
+            ? '<button type="button" onclick="startWrongPoolQuiz()" style="width:100%;margin-top:10px;background:#dc3545;color:#fff;border:none;padding:12px;border-radius:8px;font-weight:700;cursor:pointer;">Practice ' + c.toFix + ' to fix</button>'
+            : '')
+        + (c.attempts > 0
+            ? '<div style="text-align:center;margin-top:8px;"><button type="button" onclick="askResetPool()" style="background:none;border:none;color:#8892b0;font-size:0.78em;text-decoration:underline;cursor:pointer;padding:6px;">Reset tracking</button></div>'
+            : '')
+        + '</div>';
+}
+
+/** Re-draws the banner in place (after a reset). */
+function refreshMcqPoolBanner() {
+    const el = document.getElementById('mcq-pool-banner');
+    if (!el) return;
+    const tmp = document.createElement('div');
+    tmp.innerHTML = _mcqPoolBannerHtml();
+    if (tmp.firstElementChild) el.replaceWith(tmp.firstElementChild); else el.remove();
+}
+
+// ---------- Reset tracking (in-app confirm, not a browser popup) ----------
+function askResetPool() { openOverlay(document.getElementById('pool-reset-modal')); }
+function closePoolResetModal() { closeOverlay(document.getElementById('pool-reset-modal')); }
+function confirmResetPool() {
+    closePoolResetModal();
+    clearMcqWrongPool();
+    showAppNotification('🎯 Question tracking reset.', 'info', 2000);
+    refreshMcqPoolBanner();
+}
+
+/** One-time cleanup of the retired MCQ spaced-repetition data. */
+function _cleanupRetiredMcqSrs() {
+    try {
+        if (localStorage.getItem('pool_migrated_v1')) return;
+        Object.keys(localStorage)
+            .filter(function (k) { return k.indexOf('kaeri_mcq_srs_v1_') === 0; })
+            .forEach(function (k) { localStorage.removeItem(k); });
+        localStorage.setItem('pool_migrated_v1', '1');
+    } catch (e) {}
+}
+
 
 // ============================================================
 // === 8. FLASHCARD ENGINE - HYBRID MASTER (LINEAR + SRS) ===
@@ -2555,11 +4095,11 @@ function showFlashcardCompletion() {
 // ============================================================
 
 function challengeFriend(score, total, modeName) {
-    const link = "https://kaerikalmar.github.io/KAERI-CBU-REVISIONS-SITE/";
+    const link = "https://kaerikalmar.github.io/KaeriEdTech";
     let message = "";
     
     if (modeName === "Flashcards") {
-        message = `I mastered the ${score} Flashcard Deck on Kaeri EdTech! Challenge you to beat me! 👇\n${link}`;
+        message = `I mastered the ${score} Flashcard Deck on Kaeri EdTech! I Challenge you to beat me! 👇\n${link}`;
     } else {
         const percent = Math.round((score / total) * 100);
         message = `I scored ${percent}% (${score}/${total}) in ${currentCourse} ${currentTerm} (${modeName})! Challenge you to beat my score! 👇\n${link}`;
@@ -2650,9 +4190,28 @@ function _itemCardHTML(item, sectionName, type, idx, pal) {
     if (type === 'mcq') {
         labelText = 'Q' + (idx + 1);
         qHTML = md(item.q);
-        const opt = (item.options && item.options[item.correct] !== undefined)
-            ? String.fromCharCode(65 + item.correct) + '. ' + md(item.options[item.correct]) : '—';
-        aHTML = '<strong>Answer:</strong> ' + opt;
+
+        // Full options list — highlight correct choice for revision-kit self-test
+        let optionsHTML = '<div style="margin:8px 0 10px 0;">';
+        (item.options || []).forEach(function (opt, i) {
+            const letter    = String.fromCharCode(65 + i);
+            const isCorrect = (i === item.correct);
+            if (isCorrect) {
+                optionsHTML += '<div style="padding:5px 10px;margin:3px 0;'
+                    + 'background:#e8f5e9;border-left:4px solid #28a745;'
+                    + 'border-radius:0 4px 4px 0;font-weight:700;color:#1e3a2f;">'
+                    + letter + '. ' + md(opt) + ' <span style="color:#28a745;">✓</span>'
+                    + '</div>';
+            } else {
+                optionsHTML += '<div style="padding:5px 10px;margin:3px 0;color:#444;">'
+                    + letter + '. ' + md(opt)
+                    + '</div>';
+            }
+        });
+        optionsHTML += '</div>';
+
+        qHTML += optionsHTML;
+        aHTML = '<strong>Answer:</strong> ' + String.fromCharCode(65 + item.correct);
         eHTML = md(item.explanation || 'No additional explanation.');
     } else if (type === 'shortAnswer') {
         labelText = 'Q' + (idx + 1);
@@ -2800,8 +4359,10 @@ function _buildFullPrintDocument(course, term, sessionType, sections, date) {
     const termLabel = _termLabel(term);
     const sessInfo  = SESSION_LABELS[sessionType] || { title: sessionType, icon: '📄' };
     
-    // ✅ QR code points to REVISION PLATFORM (not WhatsApp)
-    const qrUrl = 'https://quickchart.io/qr?text=https%3A%2F%2Fkaerikalmar.github.io%2FKAERI-CBU-REVISIONS-SITE%2F&dark=111435&size=300';
+    // ✅ QR code points to Kaeri EdTech revision platform
+// ✅ Updated URL + vertical-line-style QR rendering attempt
+const platformUrl = 'https://kaerikalmar.github.io/KaeriEdTech';
+const qrUrl = 'https://quickchart.io/qr?text=' + encodeURIComponent(platformUrl) + '&dark=111435&size=300&margin=2';
 
     let totalItems = 0;
     sections.forEach(s => { totalItems += s.items.length; });
@@ -3046,8 +4607,23 @@ function _buildFullPrintDocument(course, term, sessionType, sections, date) {
         let qText = '', ansHtml = '', explHtml = '';
         if (sessionType === 'mcq') {
             qText = parseKaeriMarkdown(item.q || '');
-            const correctOpt = (item.options && item.options[item.correct]) ? item.options[item.correct] : '—';
-            ansHtml = '<strong>Answer:</strong> ' + parseKaeriMarkdown(correctOpt);
+            var opts = item.options || [];
+            var optsHtml = '<div style="margin:8px 0 10px 0;">';
+            for (var i = 0; i < opts.length; i++) {
+                var letter = String.fromCharCode(65 + i);
+                var isCorrect = (i === item.correct);
+                if (isCorrect) {
+                    optsHtml += '<div style="padding:5px 10px;margin:3px 0;background:#e8f5e9;border-left:4px solid #28a745;border-radius:0 4px 4px 0;font-weight:700;color:#1e3a2f;">'
+                        + letter + '. ' + parseKaeriMarkdown(opts[i])
+                        + ' <span style="color:#28a745;">✓</span></div>';
+                } else {
+                    optsHtml += '<div style="padding:5px 10px;margin:3px 0;color:#444;">'
+                        + letter + '. ' + parseKaeriMarkdown(opts[i]) + '</div>';
+                }
+            }
+            optsHtml += '</div>';
+            qText += optsHtml;
+            ansHtml = '<strong>Answer:</strong> ' + String.fromCharCode(65 + item.correct);
             explHtml = parseKaeriMarkdown(item.explanation || 'No additional explanation.');
         } else if (sessionType === 'shortAnswer') {
             qText = parseKaeriMarkdown(item.q || '');
@@ -3138,8 +4714,11 @@ function _buildFullPrintDocument(course, term, sessionType, sections, date) {
 </body>
 </html>`;
 }
-// ============================================================
+
+    // ============================================================
 // === 10. UTILITIES ===
+// === v1.1 PATCH: + _escAttr (JS-string escape) + shuffleQuestionOptions (orderMatters) ===
+// === v1.6 PATCH: + naturalSort for correct numeric unit/sub-topic ordering ===
 // ============================================================
 
 function filterDataByCourseAndTerm(data, course, term) {
@@ -3168,71 +4747,289 @@ function shuffle(array) {
     return array;
 }
 
+// Escape for JS-string context (inline onclick attributes).
+// Distinct from escapeHtml() which is for HTML-entity context.
+function _escAttr(s) {
+    return String(s).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+}
+
+// Natural sort helper: Fixes the "Unit 10" appearing before "Unit 6" issue.
+// Compares strings numerically so 2 comes before 10.
+function naturalSort(a, b) {
+    return String(a).localeCompare(String(b), undefined, { numeric: true, sensitivity: 'base' });
+}
+
+// Shuffle a question's answer options, honouring the question's authorial intent.
+//   orderMatters === 'sequential'               → keep options in author order
+//   orderMatters === 'all-of-the-above'         → shuffle distractors, keep last option last
+//   orderMatters === 'both-a-and-b'             → same as above
+//   (default)                                    → shuffle all, remap `correct`
+function shuffleQuestionOptions(q) {
+    if (!Array.isArray(q.options) || q.options.length < 2) return Object.assign({}, q);
+    if (q.orderMatters === 'sequential') return Object.assign({}, q);
+
+    if (q.orderMatters === 'all-of-the-above' || q.orderMatters === 'both-a-and-b') {
+        const distractors = q.options.slice(0, -1);
+        const last        = q.options[q.options.length - 1];
+        shuffle(distractors);
+        const newOptions  = distractors.concat([last]);
+        return Object.assign({}, q, {
+            options: newOptions,
+            correct: newOptions.indexOf(q.options[q.correct])
+        });
+    }
+
+    const order = q.options.map(function (_, i) { return i; });
+    shuffle(order);
+    return Object.assign({}, q, {
+        options: order.map(function (i) { return q.options[i]; }),
+        correct: order.indexOf(q.correct)
+    });
+}
 // ============================================================
 // === 11. TEXT-TO-SPEECH (SMART HUMAN ENGINE) ===
+// === v1.5: fixed math reading order, chunked speech (no 15s cut-off),
+// ===       voice + speed settings, pause/resume, replay, support checks ===
 // ============================================================
 
+const ttsSupported = (typeof window !== 'undefined')
+    && ('speechSynthesis' in window)
+    && (typeof SpeechSynthesisUtterance !== 'undefined');
+
+// Word commands use (?![A-Za-z]) so "\int" is never caught by "\in", "\to" by "\top", etc.
 const ttsMap = [
-    { r: /\\alpha/g, s: "alpha" }, { r: /\\beta/g, s: "beta" }, { r: /\\gamma/g, s: "gamma" },
-    { r: /\\theta/g, s: "theta" }, { r: /\\lambda/g, s: "lambda" }, { r: /\\pi/g, s: "pi" },
-    { r: /\\Delta/g, s: "Delta" }, { r: /\\mu/g, s: "mew" }, { r: /\\sigma/g, s: "sigma" },
-    { r: /\\therefore/g, s: "therefore" }, { r: /\\exists/g, s: "there exists" },
-    { r: /\\forall/g, s: "for all" }, { r: /\\in/g, s: "is an element of" },
-    { r: /\\cup/g, s: "union" }, { r: /\\cap/g, s: "intersection" },
-    { r: /\\sin/g, s: "sine" }, { r: /\\cos/g, s: "cosine" }, { r: /\\tan/g, s: "tangent" },
-    { r: /\\int/g, s: "the integral of" }, { r: /\\sum/g, s: "the sum of" },
-    { r: /dy\/dx/g, s: "d y d x" }, { r: /\\lim/g, s: "the limit" }, { r: /\\to/g, s: "approaches" },
+    // Greek letters / symbols
+    { r: /\\infty(?![A-Za-z])/g, s: " infinity " },
+    { r: /\\alpha(?![A-Za-z])/g, s: "alpha" }, { r: /\\beta(?![A-Za-z])/g, s: "beta" }, { r: /\\gamma(?![A-Za-z])/g, s: "gamma" },
+    { r: /\\theta(?![A-Za-z])/g, s: "theta" }, { r: /\\lambda(?![A-Za-z])/g, s: "lambda" }, { r: /\\pi(?![A-Za-z])/g, s: "pi" },
+    { r: /\\Delta(?![A-Za-z])/g, s: "Delta" }, { r: /\\delta(?![A-Za-z])/g, s: "delta" }, { r: /\\mu(?![A-Za-z])/g, s: "mew" },
+    { r: /\\sigma(?![A-Za-z])/g, s: "sigma" }, { r: /\\omega(?![A-Za-z])/g, s: "omega" }, { r: /\\Omega(?![A-Za-z])/g, s: "Omega" },
+    // Logic / sets  (\int MUST come before \in)
+    { r: /\\therefore(?![A-Za-z])/g, s: "therefore" }, { r: /\\exists(?![A-Za-z])/g, s: "there exists" },
+    { r: /\\forall(?![A-Za-z])/g, s: "for all" },
+    { r: /\\int(?![A-Za-z])/g, s: "the integral of" },
+    { r: /\\in(?![A-Za-z])/g, s: "is an element of" },
+    { r: /\\cup(?![A-Za-z])/g, s: "union" }, { r: /\\cap(?![A-Za-z])/g, s: "intersection" },
+    // Functions / calculus
+    { r: /\\sin(?![A-Za-z])/g, s: "sine" }, { r: /\\cos(?![A-Za-z])/g, s: "cosine" }, { r: /\\tan(?![A-Za-z])/g, s: "tangent" },
+    { r: /\\ln(?![A-Za-z])/g, s: "natural log" }, { r: /\\log(?![A-Za-z])/g, s: "log" },
+    { r: /\\sum(?![A-Za-z])/g, s: "the sum of" },
+    { r: /dy\/dx/g, s: "d y d x" }, { r: /\\lim(?![A-Za-z])/g, s: "the limit" },
+    { r: /\\rightarrow(?![A-Za-z])/g, s: "approaches" }, { r: /\\to(?![A-Za-z])/g, s: "approaches" },
+    { r: /\\Rightarrow(?![A-Za-z])/g, s: "implies" }, { r: /\\leftrightarrow(?![A-Za-z])/g, s: "if and only if" },
+    // Fractions / powers / roots
     { r: /\\frac\{1\}\{2\}/g, s: "one half" },
     { r: /\\frac\{(.+?)\}\{(.+?)\}/g, s: "$1 over $2" },
-    { r: /\^2/g, s: " squared" }, { r: /\^3/g, s: " cubed" },
+    { r: /\^2(?![0-9])/g, s: " squared" }, { r: /\^3(?![0-9])/g, s: " cubed" },
     { r: /\^\{(.+?)\}/g, s: " to the power of $1" },
     { r: /\\sqrt\{(.+?)\}/g, s: "the square root of $1" },
     { r: /\\vec\{(.+?)\}/g, s: "vector $1" },
-    { r: /\\approx/g, s: "is approximately" }, { r: /\\neq/g, s: "is not equal to" },
-    { r: /\\leq/g, s: "less or equal" }, { r: /\\geq/g, s: "greater or equal" },
-    { r: /\\times/g, s: "times" }, { r: /\\div/g, s: "divided by" }, { r: /\\cdot/g, s: "dot" },
-    { r: /\\ce\{(.+?)\}/g, s: "$1" }, { r: /->/g, s: "yields" },
-    { r: /\*\*/g, s: "" }, { r: /__/g, s: "" }, { r: /#/g, s: "" }, { r: />/g, s: "" },
-    { r: /\\text\{(.+?)\}/g, s: "$1" }, { r: /\$\$/g, s: "" }, { r: /\$/g, s: "" }, { r: /\\/g, s: "" }
+    // Comparisons / operators
+    { r: /\\approx(?![A-Za-z])/g, s: "is approximately" }, { r: /\\neq(?![A-Za-z])/g, s: "is not equal to" },
+    { r: /\\leq?(?![A-Za-z])/g, s: "less than or equal to" }, { r: /\\geq?(?![A-Za-z])/g, s: "greater than or equal to" },
+    { r: /\\times(?![A-Za-z])/g, s: "times" }, { r: /\\div(?![A-Za-z])/g, s: "divided by" }, { r: /\\cdot(?![A-Za-z])/g, s: "dot" },
+    { r: /\\pm(?![A-Za-z])/g, s: "plus or minus" }, { r: /\\circ(?![A-Za-z])/g, s: " degrees" },
+    // Chemistry / text wrappers
+    { r: /\\ce\{(.+?)\}/g, s: "$1" }, { r: /->/g, s: " yields " },
+    { r: /\\text\{(.+?)\}/g, s: "$1" }, { r: /\\mathrm\{(.+?)\}/g, s: "$1" },
+    // Markdown clean-up
+    { r: /\*\*/g, s: "" }, { r: /__/g, s: "" }, { r: /^#+\s*/gm, s: "" }, { r: /^>\s?/gm, s: "" },
+    // Subscripts (after "__" is removed)
+    { r: /_\{(.+?)\}/g, s: " sub $1" }, { r: /_([A-Za-z0-9])/g, s: " sub $1" },
+    // Plain-text maths symbols
+    { r: /\s>\s/g, s: " is greater than " }, { r: /\s<\s/g, s: " is less than " },
+    { r: /≤/g, s: " less than or equal to " }, { r: /≥/g, s: " greater than or equal to " },
+    { r: /≠/g, s: " is not equal to " }, { r: /≈/g, s: " is approximately " },
+    { r: /×/g, s: " times " }, { r: /÷/g, s: " divided by " }, { r: /→/g, s: " yields " },
+    { r: /±/g, s: " plus or minus " }, { r: /√/g, s: " square root of " }, { r: /∞/g, s: " infinity " },
+    { r: /°C/g, s: " degrees Celsius" }, { r: /°/g, s: " degrees" }, { r: /%/g, s: " percent" },
+    // Whatever LaTeX is left
+    { r: /\$\$/g, s: "" }, { r: /\$/g, s: "" }, { r: /\\/g, s: "" }
 ];
 
 function humanizeLaTeX(text) {
-    let cleanText = text;
+    let cleanText = String(text == null ? '' : text)
+        .replace(/<\/?[a-zA-Z][^>]*>/g, ' ')          // HTML tags
+        .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&');
     ttsMap.forEach(map => { cleanText = cleanText.replace(map.r, map.s); });
     return cleanText.replace(/\s+/g, ' ').trim();
 }
 
+// ---------- Reader state ----------
+let ttsRate = (function () {
+    const v = parseFloat(localStorage.getItem('kaeri_tts_rate'));
+    return (isFinite(v) && v >= 0.5 && v <= 2) ? v : 1;
+})();
+let ttsVoiceURI = localStorage.getItem('kaeri_tts_voice') || '';
+let ttsVoices = [];
+let ttsSession = 0;          // bumped on every stop so stale callbacks do nothing
+let ttsQueue = [];           // chunks still to speak
+let ttsCurrentChunk = '';
+let ttsSpeaking = false;
+let ttsPaused = false;
+let ttsLastText = '';
 let utterance = null;
+
+function _loadVoices() {
+    if (!ttsSupported) return;
+    try { ttsVoices = window.speechSynthesis.getVoices() || []; } catch (e) { ttsVoices = []; }
+}
+if (ttsSupported) {
+    _loadVoices();
+    try {
+        window.speechSynthesis.addEventListener('voiceschanged', function () {
+            _loadVoices();
+            _fillTtsVoiceList();
+        });
+    } catch (e) {}
+} else {
+    document.documentElement.classList.add('no-tts');
+}
+
+/** Saved voice, else the best English voice on the device (Zambian > South African > British > US > any English). */
+function ttsPickVoice() {
+    if (!ttsVoices.length) return null;
+    if (ttsVoiceURI) {
+        const saved = ttsVoices.find(v => v.voiceURI === ttsVoiceURI);
+        if (saved) return saved;
+    }
+    const norm = v => String(v.lang || '').replace('_', '-').toLowerCase();
+    const order = ['en-zm', 'en-za', 'en-gb', 'en-us'];
+    for (let i = 0; i < order.length; i++) {
+        const hit = ttsVoices.find(v => norm(v) === order[i]);
+        if (hit) return hit;
+    }
+    return ttsVoices.find(v => /^en/.test(norm(v))) || null;
+}
+
+/** Break text into short, natural chunks. Chrome silently stops utterances that run past ~15 seconds. */
+function splitForSpeech(text) {
+    const MAX = 200;
+    const pieces = String(text).match(/[^.!?…]+[.!?…]*\s*/g) || [String(text)];
+    const chunks = [];
+    let cur = '';
+    const push = s => { s = s.trim(); if (s) chunks.push(s); };
+    pieces.forEach(p => {
+        if (p.length > MAX) {
+            push(cur); cur = '';
+            let rest = p;
+            while (rest.length > MAX) {
+                let cut = rest.lastIndexOf(',', MAX);
+                if (cut < 60) cut = rest.lastIndexOf(' ', MAX);
+                if (cut < 20) cut = MAX;
+                push(rest.slice(0, cut + 1));
+                rest = rest.slice(cut + 1);
+            }
+            cur = rest;
+        } else if ((cur + p).length > MAX) {
+            push(cur); cur = p;
+        } else {
+            cur += p;
+        }
+    });
+    push(cur);
+    return chunks;
+}
+
+function _speakNext(session) {
+    if (session !== ttsSession) return;
+    if (!ttsQueue.length) {
+        ttsSpeaking = false; ttsCurrentChunk = ''; utterance = null;
+        _syncStripTts();
+        return;
+    }
+    ttsCurrentChunk = ttsQueue.shift();
+    const u = new SpeechSynthesisUtterance(ttsCurrentChunk);
+    const v = ttsPickVoice();
+    if (v) { u.voice = v; u.lang = v.lang; } else { u.lang = 'en-GB'; }
+    u.rate = ttsRate;
+    u.onend = function () { _speakNext(session); };
+    u.onerror = function (e) {
+        if (e && (e.error === 'canceled' || e.error === 'interrupted')) return;
+        _speakNext(session);
+    };
+    utterance = u;
+    ttsSpeaking = true;
+    _syncStripTts();
+    try { window.speechSynthesis.speak(u); } catch (e) { ttsSpeaking = false; _syncStripTts(); }
+}
+
+function stopReading() {
+    ttsSession++;
+    ttsQueue = [];
+    ttsCurrentChunk = '';
+    ttsSpeaking = false;
+    ttsPaused = false;
+    utterance = null;
+    if (ttsSupported) { try { window.speechSynthesis.cancel(); } catch (e) {} }
+    _syncStripTts();
+}
+
+/** Speak text. opts.force = speak even if the reader is switched off (explicit Replay / Test taps). */
+function readText(text, opts) {
+    opts = opts || {};
+    if (!ttsSupported) return;
+    if (!ttsEnabled && !opts.force) return;
+    const clean = humanizeLaTeX(text);
+    if (!clean) return;
+    stopReading();
+    ttsLastText = clean;
+    ttsQueue = splitForSpeech(clean);
+    const session = ttsSession;
+    // Small gap after cancel(): some Android builds drop speech started in the same tick.
+    setTimeout(function () { _speakNext(session); }, 60);
+}
+
+/** Pause/resume that works on every browser (Android's native pause() is unreliable): stop, remember, continue later. */
+function toggleReadPause() {
+    if (!ttsSupported) return;
+    if (ttsPaused) {
+        ttsPaused = false;
+        const resume = ttsQueue.slice();
+        ttsSession++;
+        ttsQueue = resume;
+        const session = ttsSession;
+        _syncStripTts();
+        _speakNext(session);
+        return;
+    }
+    if (ttsSpeaking) {
+        const remaining = [ttsCurrentChunk].concat(ttsQueue).filter(Boolean);
+        ttsSession++;
+        try { window.speechSynthesis.cancel(); } catch (e) {}
+        ttsQueue = remaining;
+        ttsSpeaking = false;
+        ttsPaused = true;
+        _syncStripTts();
+        return;
+    }
+    replayReading();
+}
+
 function updateTtsButtonText() {
     const ttsButton = document.getElementById('tts-toggle-button');
     if (ttsButton) ttsButton.textContent = ttsEnabled ? '🔊 Turn Reader Off' : '🔇 Turn Reader On';
 }
 
 function toggleTTS() {
+    if (!ttsSupported) {
+        showAppNotification("🔇 This browser can't read aloud. Try Chrome or Safari.", "warning", 3500);
+        return;
+    }
     ttsEnabled = !ttsEnabled;
     localStorage.setItem("ttsEnabled", ttsEnabled);
     stopReading();
     updateTtsButtonText();
     showAppNotification(ttsEnabled ? "🔊 Reader is now ON." : "🔇 Reader is now OFF.");
     logAnalyticsEvent('tts_toggle', ttsEnabled ? 'ON' : 'OFF');
+    // Speaking right after the tap also unlocks audio on iPhones.
+    if (ttsEnabled) readText('Reader is on.', { force: true });
 }
 
-function stopReading() {
-    if (utterance) { window.speechSynthesis.cancel(); utterance = null; }
-}
-
-function readText(text) {
-    if (!ttsEnabled) return;
-    stopReading();
-    utterance = new SpeechSynthesisUtterance(text);
-    window.speechSynthesis.speak(utterance);
-}
-
-function readCurrentQuestion() {
-    if (!ttsEnabled) return;
-    stopReading();
+/** The text for whatever is on screen right now (question, essay step or flashcard). '' if nothing. */
+function buildCurrentReadText() {
     let textToRead = "";
-    if (currentQuizType === 'mcq' || currentQuizType === 'shortAnswer') {
+    if ((currentQuizType === 'mcq' || currentQuizType === 'shortAnswer') && currentQuizData && currentQuizData[currentQuestionIndex]) {
         const qData = currentQuizData[currentQuestionIndex];
         textToRead += "Question " + (currentQuestionIndex + 1) + ". " + humanizeLaTeX(qData.q) + ". ";
         if (qData.options) {
@@ -3241,25 +5038,113 @@ function readCurrentQuestion() {
                 textToRead += String.fromCharCode(65 + i) + ". " + humanizeLaTeX(opt) + ". ... ";
             });
         }
-    } else if (currentQuizType === 'essay') {
+    } else if (currentQuizType === 'essay' && currentEssay && currentEssay.steps && currentEssay.steps[currentStepIndex]) {
         const step = currentEssay.steps[currentStepIndex];
         textToRead += "Step " + (currentStepIndex + 1) + ". " + humanizeLaTeX(step.q) + ". ";
-        step.options.forEach((opt, i) => {
+        (step.options || []).forEach((opt, i) => {
             textToRead += String.fromCharCode(65 + i) + ". " + humanizeLaTeX(opt) + ". ... ";
         });
+    } else if (currentQuizType === 'flashcard' && currentFlashcards && currentFlashcards[currentCardIndex]) {
+        const card = currentFlashcards[currentCardIndex];
+        textToRead = isCardFront ? "Front: " + humanizeLaTeX(card.front) : "Back: " + humanizeLaTeX(card.back);
     }
-    readText(textToRead);
+    return textToRead;
+}
+
+function readCurrentQuestion() {
+    if (!ttsEnabled) return;
+    const t = buildCurrentReadText();
+    if (t) readText(t);
 }
 
 function readFlashcard() {
     if (!ttsEnabled) return;
-    stopReading();
     const card = currentFlashcards[currentCardIndex];
+    if (!card) return;
     readText(isCardFront ? "Front: " + humanizeLaTeX(card.front) : "Back: " + humanizeLaTeX(card.back));
 }
 
+/** 🔁 Replay: re-reads the current question/card, even when the reader is switched off. */
+function replayReading() {
+    if (!ttsSupported) {
+        showAppNotification("🔇 This browser can't read aloud. Try Chrome or Safari.", "warning", 3500);
+        return;
+    }
+    const t = buildCurrentReadText() || ttsLastText;
+    if (!t) { showAppNotification('Nothing to read yet. Open a question first.', 'info', 2200); return; }
+    readText(t, { force: true });
+}
+
+// ---------- Reader settings (voice + speed) ----------
+function _fillTtsVoiceList() {
+    const sel = document.getElementById('tts-voice');
+    if (!sel) return;
+    sel.innerHTML = '';
+    const auto = document.createElement('option');
+    auto.value = ''; auto.textContent = 'Automatic (best English voice)';
+    sel.appendChild(auto);
+    const norm = v => String(v.lang || '').replace('_', '-');
+    const english = ttsVoices.filter(v => /^en/i.test(norm(v)));
+    (english.length ? english : ttsVoices).forEach(v => {
+        const o = document.createElement('option');
+        o.value = v.voiceURI;
+        o.textContent = v.name + ' (' + norm(v) + ')';
+        sel.appendChild(o);
+    });
+    sel.value = ttsVoiceURI && Array.prototype.some.call(sel.options, o => o.value === ttsVoiceURI) ? ttsVoiceURI : '';
+}
+
+function _syncTtsSettings() {
+    const r = document.getElementById('tts-rate');
+    if (r) r.value = ttsRate;
+    const l = document.getElementById('tts-rate-label');
+    if (l) l.textContent = ttsRate.toFixed(1).replace(/\.0$/, '') + '×';
+    const on = document.getElementById('tts-on');
+    if (on) on.checked = !!ttsEnabled;
+}
+
+function openTtsSettings() {
+    if (!ttsSupported) {
+        showAppNotification("🔇 This browser can't read aloud. Try Chrome or Safari.", "warning", 3500);
+        return;
+    }
+    _loadVoices();
+    _fillTtsVoiceList();
+    _syncTtsSettings();
+    openOverlay(document.getElementById('tts-modal'));
+}
+
+function closeTtsSettings() {
+    closeOverlay(document.getElementById('tts-modal'));
+    stopReading();
+}
+
+function setTtsRate(v) {
+    const n = parseFloat(v);
+    if (!isFinite(n)) return;
+    ttsRate = Math.min(2, Math.max(0.5, n));
+    localStorage.setItem('kaeri_tts_rate', String(ttsRate));
+    _syncTtsSettings();
+}
+
+function setTtsVoice(uri) {
+    ttsVoiceURI = uri || '';
+    localStorage.setItem('kaeri_tts_voice', ttsVoiceURI);
+}
+
+function testTtsVoice() {
+    readText('Hello! This is how the reader will sound while you study.', { force: true });
+}
+
+// Never keep talking after the student leaves the tab or page.
+document.addEventListener('visibilitychange', function () { if (document.hidden) stopReading(); });
+window.addEventListener('pagehide', function () { stopReading(); });
+
+
 // ============================================================
 // === 12. GLOBAL EVENT HANDLERS & STUDENT BOARD ===
+// === v1.1 PATCH: + beforeunload guard; keyboard "next" prefers shell bar ===
+// === v1.2 PATCH: + call hideUnavailableTerms() at boot ===
 // ============================================================
 
 function renderStudentBoard() {
@@ -3351,10 +5236,16 @@ document.addEventListener("keydown", (e) => {
                 if (currentQuizType === "mcq") checkMcqAnswer();
                 if (currentQuizType === "essay") checkEssayStep();
                 break;
-            case " ": case "n": case "N":
-                const nextBtn = document.querySelector("#result button");
+            case " ": case "n": case "N": {
+                // Prefer the shell action bar's last button if it exists (new pattern),
+                // otherwise fall back to the legacy "#result button" (original pattern).
+                const shellBtns = document.querySelectorAll(".shell-actions button");
+                const nextBtn = shellBtns.length
+                    ? shellBtns[shellBtns.length - 1]
+                    : document.querySelector("#result button");
                 if (nextBtn) nextBtn.click();
                 break;
+            }
         }
     }
     
@@ -3392,7 +5283,22 @@ document.addEventListener("keydown", (e) => {
     }
 });
 
+// Guard against accidental refresh while a quiz is in progress.
+// Scoped to MCQ / SA / Essay (flashcards don't hold unsaved progress).
+window.addEventListener('beforeunload', function (e) {
+    const active = ['mcq', 'shortAnswer', 'essay'].includes(currentQuizType)
+        && currentQuizData.length > 0
+        && currentQuestionIndex < currentQuizData.length;
+    if (active) {
+        e.preventDefault();
+        e.returnValue = '';
+    }
+});
+
 document.addEventListener('DOMContentLoaded', function() {
+    // Disable term buttons whose dataset file isn't yet in the manifest.
+    hideUnavailableTerms();
+
     const closeBtn = document.querySelector('.close-print-preview');
     if(closeBtn) closeBtn.addEventListener('click', closePrintPreview);
     
@@ -3519,7 +5425,78 @@ document.addEventListener('DOMContentLoaded', function() {
 
 // ============================================================
 // === REORGANISATION LAYER (navigation, quiz strip, referral) ===
+// === v1.1 PATCH: + URL routing + deep-link restore + backToMenu wrapper ===
 // ============================================================
+
+// ---------- URL routing (course + term in query string) ----------
+// Sets up deep-linking: ?course=CS110&term=T1 restores the course on load,
+// and the browser back button works without needing a UI back handler.
+let _suppressNextNavigate = false;
+
+function buildURL(route) {
+    const p = new URLSearchParams();
+    if (route.course) p.set('course', route.course);
+    if (route.term)   p.set('term', route.term);
+    const qs = p.toString();
+    return qs ? location.pathname + '?' + qs : location.pathname;
+}
+
+function parseURL() {
+    const p = new URLSearchParams(location.search);
+    return {
+        course: p.get('course'),
+        term:   p.get('term')
+    };
+}
+
+function navigate(route, opts) {
+    opts = opts || {};
+    if (_suppressNextNavigate) { _suppressNextNavigate = false; return; }
+    const next = Object.assign({}, route);
+    try {
+        if (opts.replace) history.replaceState(next, '', buildURL(next));
+        else             history.pushState(next, '', buildURL(next));
+    } catch (e) {}
+}
+
+function applyRoute(route) {
+    // Topmost overlay absorbs Escape/Back first.
+    if (typeof overlayStack !== 'undefined' && overlayStack.length > 0) {
+        closeOverlay(overlayStack[overlayStack.length - 1].el);
+        return;
+    }
+
+    if (!route.course || !route.term) {
+        if (getViewedScope().course || currentCourse) { _suppressNextNavigate = true; backToMenu(); }
+        return;
+    }
+
+    const key = (route.course + '_' + route.term).toUpperCase();
+    const viewed = getViewedScope();
+    const viewedKey = (viewed.course && viewed.term) ? viewed.course + '_' + viewed.term : '';
+    if (key !== viewedKey) {
+        _suppressNextNavigate = true;
+        loadCourse(route.course, route.term);
+    }
+}
+
+window.addEventListener('popstate', function (e) {
+    const route = e.state || parseURL();
+    applyRoute(route);
+});
+
+// Wrap backToMenu so every exit clears the MCQ wizard state.
+// (loadCourse already suppresses an extra history push via _suppressNextNavigate.)
+(function () {
+    const orig = window.backToMenu;
+    if (typeof orig !== 'function') return;
+    window.backToMenu = function () {
+        try { resetMcqWizardState(); } catch (e) {}
+        const out = orig.apply(this, arguments);
+        try { navigate({}); } catch (e) {}
+        return out;
+    };
+})();
 
 // ---------- Welcome <-> Courses ----------
 function _reducedMotion() {
@@ -3601,6 +5578,11 @@ function _syncFocusMode() {
 function _syncStripTts() {
     const b = document.getElementById('qs-tts');
     if (b) b.textContent = ttsEnabled ? '🔊' : '🔇';
+    const p = document.getElementById('qs-pause');
+    if (p) p.textContent = ttsPaused ? '▶️' : '⏸';
+    document.body.classList.toggle('tts-active', !!(ttsSpeaking || ttsPaused));
+    const on = document.getElementById('tts-on');
+    if (on) on.checked = !!ttsEnabled;
 }
 
 function _syncQuizStrip(current, total, percent) {
@@ -3733,6 +5715,7 @@ function _focusScreen() {
     _syncFocusMode();
     const qf = document.getElementById('quiz-form');
     if (!qf || !qf.childNodes.length) return;
+    mountScreen(qf);
     const delta = qf.getBoundingClientRect().top - _stripOffset();
     if (Math.abs(delta) > 6) _scrollToTop(qf);
 }
@@ -3906,6 +5889,14 @@ function submitAmbassadorReferral() {
 
 // ---------- Boot ----------
 document.addEventListener('DOMContentLoaded', function () {
+    // Live prices/durations from PAY-AMB (non-blocking if offline)
+    try {
+        loadSystemConfig().catch(function (err) {
+            console.warn('[config] live prices unavailable:', err && err.message);
+            refreshPriceUI();
+        });
+    } catch (e) {}
+    try { _cleanupRetiredMcqSrs(); } catch (e) {}
     initDraggableWhatsApp();
     document.querySelectorAll('[data-amb-link]').forEach(a => { a.href = AMBASSADOR_PORTAL_URL; });
     checkForReferral();
@@ -3914,11 +5905,23 @@ document.addEventListener('DOMContentLoaded', function () {
     const view = new URLSearchParams(window.location.search).get('view');
     if (view === 'courses') showCourses(true);
 
+    // Deep link: ?course=X&term=Y restores the course directly
+    const initialRoute = parseURL();
+    if (initialRoute.course && initialRoute.term) {
+        setTimeout(function () {
+            const key = initialRoute.course + '_' + initialRoute.term;
+            _suppressNextNavigate = true; // URL already reflects the route
+            loadCourse(initialRoute.course, initialRoute.term);
+        }, 200);
+    }
+
     // Escape / backdrop close for the custom modals
     function _closeCustomModal(m) {
         if (m.id === 'reset-modal') closeResetModal();
         else if (m.id === 'exit-modal') closeExitModal();
         else if (m.id === 'referral-modal') skipAmbassadorTracking();
+        else if (m.id === 'tts-modal') closeTtsSettings();
+        else if (m.id === 'pool-reset-modal') closePoolResetModal();
     }
     document.addEventListener('keydown', e => {
         if (e.key !== 'Escape') return;
@@ -3959,6 +5962,7 @@ document.addEventListener('DOMContentLoaded', function () {
         };
     }
 });
+
 // ---------- Brand logo: one source (--brand-logo in index.html) ----------
 function _brandLogoURI() {
     try {
