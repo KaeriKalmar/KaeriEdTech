@@ -4849,10 +4849,19 @@ const ttsMap = [
 
 function humanizeLaTeX(text) {
     let cleanText = String(text == null ? '' : text)
-        .replace(/<\/?[a-zA-Z][^>]*>/g, ' ')          // HTML tags
+        // Paragraph/line breaks become real newlines first, so markdown headings ("## Title") are still
+        // recognised by the clean-up rules in ttsMap. They turn into spoken pauses further below.
+        .replace(/<br\s*\/?>/gi, '\n')
+        .replace(/<\/(p|h[1-6])\s*>/gi, '\n')
+        .replace(/<\/?[a-zA-Z][^>]*>/g, ' ')          // Other HTML tags
         .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&');
     ttsMap.forEach(map => { cleanText = cleanText.replace(map.r, map.s); });
-    return cleanText.replace(/\s+/g, ' ').trim();
+    return cleanText
+        // Each break (single or repeated) becomes ONE full stop, unless the line already ends in punctuation
+        .replace(/([.!?\u2026:;,])?[ \t]*\n\s*/g, function (m, p) { return p ? p + ' ' : '. '; })
+        // Never leave doubled sentence punctuation behind (". .", "?.", etc.)
+        .replace(/([.!?\u2026])(?:\s*[.!?\u2026])+/g, '$1')
+        .replace(/\s+/g, ' ').trim();
 }
 
 // ---------- Reader state ----------
@@ -4938,16 +4947,79 @@ function _speakNext(session) {
         _syncStripTts();
         return;
     }
-    ttsCurrentChunk = ttsQueue.shift();
-    const u = new SpeechSynthesisUtterance(ttsCurrentChunk);
+
+    // Queue chunks can hold several sentences. Speak one sentence at a time so the pause
+    // after each full stop / question mark actually happens; the rest go back to the queue front.
+    let chunk = ttsQueue.shift();
+    const parts = chunk.match(/.+?(?:[.!?\u2026]+(?=\s|$)|$)/g);
+    if (parts && parts.length > 1) {
+        const sentences = parts.map(function (x) { return x.trim(); }).filter(Boolean);
+        if (sentences.length > 1) {
+            chunk = sentences.shift();
+            ttsQueue = sentences.concat(ttsQueue);
+        }
+    }
+    ttsCurrentChunk = chunk;
+
+    const u = new SpeechSynthesisUtterance(chunk);
     const v = ttsPickVoice();
     if (v) { u.voice = v; u.lang = v.lang; } else { u.lang = 'en-GB'; }
-    u.rate = ttsRate;
-    u.onend = function () { _speakNext(session); };
+
+    // --- AUTO-ADJUSTING RHYTHM & TONE ---
+    let rateMultiplier = 1.0;
+    let pitchMultiplier = 1.0;
+
+    // 1. Math-heavy? Only real operators / spoken-math words count, never plain numbers, hyphens or "and/or".
+    const isMath = /\d\s*[=+*^\u00d7\u00f7]\s*[\d(A-Za-z]|[A-Za-z)]\s*=\s*[\d(A-Za-z-]|\d\s+-\s+\d|\d\/\d|\b(squared|cubed|square root|to the power of|the integral of|the sum of)\b|\bsub [A-Za-z0-9]\b|\\(frac|sqrt|times|div)/.test(chunk);
+    if (isMath) {
+        rateMultiplier = 0.8;    // 20% slower
+        pitchMultiplier = 0.95;  // slightly deeper
+    }
+
+    // 2. Question (ends in ?)
+    if (/\?\s*$/.test(chunk)) {
+        rateMultiplier *= 0.95;
+        pitchMultiplier = 1.05;
+    }
+
+    // 3. ALL-CAPS emphasis
+    if (/\b[A-Z]{4,}\b/.test(chunk)) {
+        pitchMultiplier = 1.1;
+        rateMultiplier *= 0.9;
+    }
+
+    u.rate = Math.min(10, Math.max(0.1, ttsRate * rateMultiplier));
+    u.pitch = pitchMultiplier;
+
+    // --- NATURAL PAUSING (one advance per utterance, even if both onend and onerror fire) ---
+    let advanced = false;
+    function advance(pauseTime) {
+        if (advanced) return;
+        advanced = true;
+        ttsCurrentChunk = '';   // finished: pausing during the gap must not replay this chunk
+        if (!ttsQueue.length) { _speakNext(session); return; }   // nothing left: finish straight away
+        setTimeout(function () { _speakNext(session); }, pauseTime);
+    }
+
+    u.onend = function () {
+        if (session !== ttsSession) return;
+        const lastChar = chunk.trim().slice(-1);
+        let pauseTime = 100;
+        if (isMath) {
+            pauseTime = 700;     // let the maths sink in
+        } else if (/[.!?\u2026]/.test(lastChar)) {
+            pauseTime = 500;     // full-stop breathing room
+        } else if (/[,;:]/.test(lastChar)) {
+            pauseTime = 250;     // quick breath
+        }
+        advance(pauseTime);
+    };
     u.onerror = function (e) {
         if (e && (e.error === 'canceled' || e.error === 'interrupted')) return;
-        _speakNext(session);
+        if (session !== ttsSession) return;
+        advance(100);
     };
+
     utterance = u;
     ttsSpeaking = true;
     _syncStripTts();
@@ -5033,16 +5105,17 @@ function buildCurrentReadText() {
         const qData = currentQuizData[currentQuestionIndex];
         textToRead += "Question " + (currentQuestionIndex + 1) + ". " + humanizeLaTeX(qData.q) + ". ";
         if (qData.options) {
-            textToRead += "Options are: ";
+            textToRead += "Here are the options. ";
             qData.options.forEach((opt, i) => {
-                textToRead += String.fromCharCode(65 + i) + ". " + humanizeLaTeX(opt) + ". ... ";
+                // "Option A: text." keeps the letter attached to its answer and ends every option on a full stop (500ms gap)
+                textToRead += "Option " + String.fromCharCode(65 + i) + ": " + humanizeLaTeX(opt) + ". ";
             });
         }
     } else if (currentQuizType === 'essay' && currentEssay && currentEssay.steps && currentEssay.steps[currentStepIndex]) {
         const step = currentEssay.steps[currentStepIndex];
         textToRead += "Step " + (currentStepIndex + 1) + ". " + humanizeLaTeX(step.q) + ". ";
         (step.options || []).forEach((opt, i) => {
-            textToRead += String.fromCharCode(65 + i) + ". " + humanizeLaTeX(opt) + ". ... ";
+            textToRead += "Option " + String.fromCharCode(65 + i) + ": " + humanizeLaTeX(opt) + ". ";
         });
     } else if (currentQuizType === 'flashcard' && currentFlashcards && currentFlashcards[currentCardIndex]) {
         const card = currentFlashcards[currentCardIndex];
