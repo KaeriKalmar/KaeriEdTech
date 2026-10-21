@@ -10,6 +10,7 @@
 // === v1.4 PATCH: no hardcoded prices/durations anywhere; race-free plan cards; streak-based MCQ pool + banner ===
 // === v1.5 PATCH: reader (voice/speed/pause/replay), pool right/wrong tally + building, ghost functions wired or removed ===
 // === v1.6 PATCH: naturalSort applied to unit and sub-topic ordering ===
+// === v1.7 PATCH: STRICTLY TWO BACKENDS ONLY (Gatekeeper & AMB-PAY) ===
 // ============================================================
 
 // --- CONFIGURATION ---
@@ -21,17 +22,17 @@ const KAERI_CONFIG = {
     brandShort:         'KAERI EDTECH',
     siteUrl:            'https://kaerikalmar.github.io/KaeriEdTech',
 
-    // Backend endpoints
-    appsScriptUrl:      "https://script.google.com/macros/s/AKfycbwBKr4ZAc6m_rehmEywaJhbbiN7G9sWbmvtE544lNZOWgD7e906JxW7Bz4ZuA59sSPfvg/exec",
-    docsScriptUrl:      "https://script.google.com/macros/s/AKfycbxhbrFtkTCj-6ZmnY0xmGjwxIq8YoP3mHEghVbEb4ZnVn_sKoCL_VI3CdsjEjibnGIFbQ/exec",
-    paymentScriptUrl:   "https://script.google.com/macros/s/AKfycbxtCC6oKKm2LNp4ktASmNFE0aSPehGnqui6FKmnxk1-AHktl_X8mTT1dZFRf00hxk6qOg/exec",
-    paymentApiUrl:      "https://script.google.com/macros/s/AKfycbxtCC6oKKm2LNp4ktASmNFE0aSPehGnqui6FKmnxk1-AHktl_X8mTT1dZFRf00hxk6qOg/exec",
+    // ─── THE ONLY TWO ACTIVE BACKENDS ───
+    
+    // 1. Gatekeeper Backend (Auth, Docs, Analytics)
+    gatekeeperUrl:      "https://script.google.com/macros/s/AKfycbyEgfRxU4Z6kdehvNcJloabFmwldB9CExr26G9SNHSGppTVIeGTMKFYAPz-x-eSCXuiVg/exec",
+    
+    // 2. AMB-PAY Backend (Payments, Config, Bridge)
+    ambPayUrl:          "https://script.google.com/macros/s/AKfycbwugCDutxPSDcKYRqd94x72vmC_EayLWk-JshXZKGYEvypG7iBAtAEEWOFkj9h-OmoQsw/exec",
 
     // Ambassador cross-app.
-    // The portal handles referral tracking itself and redirects back, so
-    // product-side capture stays OFF (ambassadorApiUrl empty) to avoid double-counting.
-    ambassadorPortalUrl: "AMB-PORTAL.html", // relative: portal sits in the same folder as index.html
-    ambassadorApiUrl:    "",                // TODO: paste the ambassador backend /exec URL to enable referral capture
+    ambassadorPortalUrl: "AMB-PORTAL.html", 
+    ambassadorApiUrl:    "",                
 
     // Limits and timers
     demoAttemptLimit:           10,
@@ -45,10 +46,12 @@ const KAERI_CONFIG = {
     printPopupBlockDelayMs:     60000
 };
 
-// Named aliases — every other section keeps reading these without touching the config object.
-const APPS_SCRIPT_URL       = KAERI_CONFIG.appsScriptUrl;
-const DOCS_SCRIPT_URL       = KAERI_CONFIG.docsScriptUrl;
-const PAYMENT_SCRIPT_URL    = KAERI_CONFIG.paymentScriptUrl;
+// --- LEGACY ALIASES (Mapped to the 2 active URLs) ---
+// The rest of this file relies on these specific names. 
+// Do NOT add new URLs. Everything below maps strictly to your two backends.
+const APPS_SCRIPT_URL       = KAERI_CONFIG.gatekeeperUrl;    // Gatekeeper
+const DOCS_SCRIPT_URL       = KAERI_CONFIG.gatekeeperUrl;    // Gatekeeper
+const PAYMENT_SCRIPT_URL    = KAERI_CONFIG.ambPayUrl;        // AMB-PAY
 const AMBASSADOR_PORTAL_URL = KAERI_CONFIG.ambassadorPortalUrl;
 const AMBASSADOR_API_URL    = KAERI_CONFIG.ambassadorApiUrl;
 
@@ -308,7 +311,7 @@ function parseKaeriMarkdown(text) {
 // ============================================================
 
 // ── PAYMENT CONFIGURATION & STATE (ADDED) ──
-const PAYMENT_API_URL = KAERI_CONFIG.paymentApiUrl;
+const PAYMENT_API_URL = KAERI_CONFIG.ambPayUrl;  // UPDATED: Points to AMB-PAY backend
 let inventory = {};
 let isSubmitting = false;
 let isChecking = false;
@@ -511,8 +514,10 @@ function renderMath(targetId = null) {
         if (result) renderMathInElement(result, renderOptions);
     }
 }
+
 // ============================================================
 // === 3. DOCUMENT DELIVERY ENGINE (FROM BASE A - PRESERVED) ===
+// === v1.2 PATCH: instant shimmer on tap; verify in background; then load iframe ===
 // ============================================================
 
 function injectDocViewerHTML() {
@@ -531,7 +536,7 @@ function injectDocViewerHTML() {
             <!-- Loading Skeleton Overlay (Visible initially) -->
             <div id="doc-loader-overlay" class="viewer-loader">
                 <div class="viewer-skeleton-box"></div>
-                <p style="color:#72efdd; margin-top:20px; font-size:0.9em;">Loading Preview...</p>
+                <p id="doc-loader-text" style="color:#72efdd; margin-top:20px; font-size:0.9em;">Verifying access...</p>
             </div>
 
             <!-- The Iframe -->
@@ -546,41 +551,58 @@ function injectDocViewerHTML() {
     document.body.insertAdjacentHTML('beforeend', viewerHTML);
 }
 
+// ── Stage 1: show the modal + shimmer skeleton IMMEDIATELY (instant feedback on tap) ──
+function showDocViewerLoading(title) {
+    const viewer = document.getElementById('smart-doc-viewer');
+    const iframe = document.getElementById('doc-frame');
+    const titleEl = document.getElementById('viewer-title');
+    const loader = document.getElementById('doc-loader-overlay');
+    const loaderText = document.getElementById('doc-loader-text');
+    
+    if (!viewer || !iframe) {
+        injectDocViewerHTML();
+        setTimeout(() => showDocViewerLoading(title), 50);
+        return;
+    }
+    
+    titleEl.textContent = title || "Document";
+    iframe.src = "";                                      // Clear previous to prevent ghosting
+    if (loaderText) loaderText.textContent = 'Verifying access...';
+    if (loader) loader.style.display = 'flex';            // Show shimmer right now
+    viewer.style.display = 'flex';
+    document.body.style.overflow = 'hidden';
+}
+
+// ── Stage 2: load the iframe (only called AFTER verification succeeds) ──
+function loadDocInViewer(fileId, title) {
+    const iframe = document.getElementById('doc-frame');
+    const loader = document.getElementById('doc-loader-overlay');
+    const loaderText = document.getElementById('doc-loader-text');
+    if (!iframe) return;
+
+    // Update the shimmer text: verification is done, now the document is loading
+    if (loaderText) loaderText.textContent = 'Loading preview...';
+
+    iframe.src = `https://drive.google.com/file/d/${fileId}/preview`;
+    iframe.onload = function () {
+        // Small buffer to ensure rendering has started
+        setTimeout(() => {
+            if (loader) loader.style.display = 'none';
+        }, 500);
+    };
+
+    // Fire-and-forget analytics
+    logAnalyticsEvent('document_view', `Viewed: ${title}`);
+}
+
+// ── Convenience wrapper (backwards compatible: shows + loads in one shot) ──
 function openDocumentViewer(fileId, title) {
     if (!fileId || fileId === 'undefined') {
         showAppNotification("⚠️ Document link unavailable", "error");
         return;
     }
-    
-    const viewer = document.getElementById('smart-doc-viewer');
-    const iframe = document.getElementById('doc-frame');
-    const titleEl = document.getElementById('viewer-title');
-    const loader = document.getElementById('doc-loader-overlay');
-    
-    if (!viewer || !iframe) {
-        injectDocViewerHTML();
-        setTimeout(() => openDocumentViewer(fileId, title), 50);
-        return;
-    }
-    
-    // Reset state
-    titleEl.textContent = title || "Document";
-    iframe.src = ""; // Clear previous to prevent ghosting
-    loader.style.display = 'flex'; // Show shimmer
-    viewer.style.display = 'flex';
-    document.body.style.overflow = 'hidden';
-    
-    // Load new document
-    iframe.src = `https://drive.google.com/file/d/${fileId}/preview`;
-    iframe.onload = function() {
-        // Small buffer to ensure rendering has started
-        setTimeout(() => {
-            loader.style.display = 'none';
-        }, 500);
-    };
-
-    // Use Base B's analytics, but triggered by Base A's viewer
-    logAnalyticsEvent('document_view', `Viewed: ${title}`);
+    showDocViewerLoading(title);
+    loadDocInViewer(fileId, title);
 }
 
 function closeDocViewer() {
@@ -597,17 +619,52 @@ function closeDocViewer() {
 // === NEW: Document Access Control & Quiz Starter Helpers ===
 // ============================================================
 
-// Document access bouncer - controls who can open documents
-function attemptOpenDoc(fileId, title) {
-    if (hasFullAccess) {
-        // Paid user: open normally
-        openDocumentViewer(fileId, title);
-    } else {
+// Document access bouncer — shows skeleton INSTANTLY, verifies in background,
+// then loads the iframe. Fixes the "frozen tap" UX delay.
+async function attemptOpenDoc(fileId, title) {
+    if (!hasFullAccess) {
         // Free user: show message and payment modal
         showAppNotification("⚠️ Documents are only accessible in Full Access mode.", "warning", 2500);
         setTimeout(() => {
             openPaymentModal();
         }, 1000);
+        return;
+    }
+
+    // ── 1. INSTANT FEEDBACK: show the viewer + shimmer right now ──
+    showDocViewerLoading(title);
+
+    // ── 2. Verify with Gatekeeper in the background ──
+    try {
+        const res = await fetch(APPS_SCRIPT_URL, {
+            method: 'POST',
+            headers: { "Content-Type": "text/plain;charset=utf-8" },
+            body: JSON.stringify({
+                action: 'verify_document_access',
+                file_id: fileId,
+                session: { 
+                    code: userCode, 
+                    email: userEmail 
+                }
+            })
+        });
+        
+        const data = await res.json();
+        
+        if (data.success) {
+            // ── 3. Verified: load the actual document ──
+            loadDocInViewer(fileId, title);
+        } else {
+            // Denied: close the viewer and tell the student why
+            closeDocViewer();
+            showAppNotification("❌ Access Denied: " + (data.message || "Unknown error"), "error");
+            if (data.code === 'SESSION_INVALID') {
+                handleSessionExpired(data.message);
+            }
+        }
+    } catch (e) {
+        closeDocViewer();
+        showAppNotification("⚠️ Connection error. Could not verify document access.", "error");
     }
 }
 
@@ -666,8 +723,7 @@ function startCustomShortAnswer() {
 // ============================================================
 
 async function renderDocuments() {
-    // IMPORTANT: Uses DOCS_SCRIPT_URL (Base A) to fetch data
-    // blockDemo check removed - everyone sees the list!
+    // IMPORTANT: Uses DOCS_SCRIPT_URL (Gatekeeper) to fetch data
     
     const container = document.getElementById("quiz-form");
     
@@ -688,12 +744,14 @@ async function renderDocuments() {
     updateProgress(0, 0);
 
     try {
+        // Flattened payload for Gatekeeper
         const payload = JSON.stringify({
             action: 'GET_STUDENT_DOCS',
-            payload: { course: currentCourse, term: currentTerm }
+            course: currentCourse, 
+            term: currentTerm      
         });
 
-        // FETCHING FROM BASE A URL
+        // FETCHING FROM GATEKEEPER URL
         const response = await fetch(DOCS_SCRIPT_URL, {
             method: 'POST',
             redirect: "follow",
@@ -772,9 +830,11 @@ async function renderDocuments() {
         container.innerHTML = `<div style="text-align:center; padding:20px; color:#dc3545;"><h3>⚠️ Connection Error</h3><p>Could not load library.</p><button class="restart-button" onclick="renderDocuments()">Try Again</button></div>`;
     }
 }
+
 // ============================================================
-// === 4. SECURITY & AUTHENTICATION (BASE B) ===
+// === 4. SECURITY & AUTHENTICATION (GATEKEEPER) ===
 // === v1.1 PATCH: three-reason session check + days_remaining tiers ===
+// === All calls route to APPS_SCRIPT_URL → Gatekeeper backend ===
 // ============================================================
 
 async function checkAccessStatus() {
@@ -817,10 +877,10 @@ async function verifyCodeFromModal() {
             redirect: "follow",
             headers: { "Content-Type": "text/plain;charset=utf-8" },
             body: JSON.stringify({
-                action: 'validate_access_code',   // Correct action for backend
+                action: 'validate_access_code',   // Gatekeeper action
                 code: userCodeInput,
                 email: userEmailInput,
-                device_fp: deviceFP,              // Backend expects device_fp
+                device_fp: deviceFP,
                 course: currentCourse,
                 term: currentTerm
             })
@@ -857,7 +917,7 @@ async function verifyCodeFromModal() {
 }
 
 // ============================================================
-// === NEW: Silent Revalidation & Session Status (BASE B) ===
+// === NEW: Silent Revalidation & Session Status (GATEKEEPER) ===
 // ============================================================
 
 async function silentRevalidation() {
@@ -868,7 +928,7 @@ async function silentRevalidation() {
             method: 'POST',
             headers: { "Content-Type": "text/plain;charset=utf-8" },
             body: JSON.stringify({
-                action: 'silent_revalidation',
+                action: 'silent_revalidation',   // Gatekeeper action
                 email: userEmail,
                 code: userCode,
                 session_token: localStorage.getItem(`token_${currentTermKey}`) || ''
@@ -893,7 +953,7 @@ async function checkSessionStatus() {
             method: 'POST',
             headers: { "Content-Type": "text/plain;charset=utf-8" },
             body: JSON.stringify({
-                action: 'check_session_status',
+                action: 'check_session_status',   // Gatekeeper action
                 email: userEmail,
                 code: userCode
             })
@@ -908,7 +968,7 @@ async function checkSessionStatus() {
         
         const data = result.data;
         
-        // ── NEW: three specific reasons for invalidity, each with its own message ──
+        // ── three specific reasons for invalidity, each with its own message ──
         if (data.email_match === false) {
             handleSessionExpired('This code belongs to a different account.');
             return;
@@ -968,7 +1028,7 @@ function startSilentRevalidation() {
 }
 
 // ============================================================
-// === NEW: Silent Analytics Logging (BASE B) ===
+// === NEW: Silent Analytics Logging (GATEKEEPER) ===
 // ============================================================
 
 function logAnalyticsEvent(actionType, details) {
@@ -978,7 +1038,7 @@ function logAnalyticsEvent(actionType, details) {
         keepalive: true,
         headers: { "Content-Type": "text/plain;charset=utf-8" },
         body: JSON.stringify({
-            action: 'log_system_event',
+            action: 'log_system_event',   // Gatekeeper action
             email: userEmail || (hasFullAccess ? 'full_access' : 'demo'),
             actionType: actionType,
             course: currentCourse,
@@ -1044,8 +1104,6 @@ function consumeDemoAttempt(type) {
     }
     localStorage.setItem(key, attempts + 1);
 }
-
-
 // ============================================================
 // === 5. PROGRESS TRACKING ENGINE (localStorage only) ===
 // ============================================================
@@ -6074,4 +6132,4 @@ function _brandLogoImg(px, radius) {
     // Retry on window load in case the stylesheet resolved after this
     // script parsed. Cheap insurance, runs once.
     window.addEventListener('load', applyFavicon);
-})();
+})(); 
