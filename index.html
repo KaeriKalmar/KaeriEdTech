@@ -1871,7 +1871,7 @@
   <!-- FLOATING WHATSAPP (draggable, position saved) -->
   <a id="draggable-wa" href="https://wa.me/260964312504" target="_blank" rel="noopener" class="landing-whatsapp-button" aria-label="WhatsApp support">💬</a>
 
- <!-- ==================== PAYMENT MODAL (TABBED + INTERNAL FORM) ==================== -->
+<!-- ==================== PAYMENT MODAL (TABBED + INTERNAL FORM) ==================== -->
 <div id="payment-modal" class="modal">
   <div class="modal-content">
     <button class="close-modal" onclick="closePaymentModal()">&times;</button>
@@ -1882,6 +1882,142 @@
       <span id="pay-duration" style="display:block; margin-top:4px; font-size:0.85rem; color:#a0a8b4;"></span>
     </div>
     <div class="pay-body">
+    
+    <!-- ═══ LIPILA METHOD SELECTOR ═══ -->
+<div id="payMethodSelector" class="hidden">
+  <h3 style="color:#72efdd; text-align:center; margin-bottom:20px;">How do you want to pay?</h3>
+
+  <div class="lipila-method-card" onclick="selectPaymentMethod('lipila')"
+       style="background:#1e2a3a; border:2px solid #72efdd; border-radius:12px; padding:20px; margin-bottom:14px; cursor:pointer; transition:0.2s;">
+    <div style="font-size:1.2em; color:#fff; font-weight:700; margin-bottom:8px;">💳 Pay Now with Mobile Money</div>
+    <div style="font-size:0.9em; color:#a0a8b4; margin-bottom:14px;">Instant · Automatic · Recommended</div>
+    <div style="text-align:right;"><button class="btn btn-inline" style="width:auto; padding:8px 20px;">Continue →</button></div>
+  </div>
+
+  <div class="lipila-method-card" onclick="selectPaymentMethod('manual')"
+       style="background:#1e2a3a; border:2px solid #3e506e; border-radius:12px; padding:20px; margin-bottom:14px; cursor:pointer; transition:0.2s;">
+    <div style="font-size:1.2em; color:#fff; font-weight:700; margin-bottom:8px;">📱 I've already paid</div>
+    <div style="font-size:0.9em; color:#a0a8b4; margin-bottom:14px;">Upload your payment screenshot</div>
+    <div style="text-align:right;"><button class="btn btn-inline btn-secondary" style="width:auto; padding:8px 20px;">Upload proof →</button></div>
+  </div>
+</div>
+
+<!-- ═══ LIPILA FORM ═══ -->
+<div id="lipilaFormView" class="hidden">
+  <button class="cancel-pay-btn" onclick="backToMethodSelector()" style="text-align:left; margin-bottom:12px;">← Back</button>
+  <h3 style="color:#72efdd; margin-bottom:8px;">💳 Pay with Mobile Money</h3>
+  <p style="color:#a0a8b4; font-size:0.9em; margin-bottom:20px;">You'll get a prompt on your phone to confirm with your PIN.</p>
+
+  <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">
+    <div class="form-group">
+      <label for="lipilaCourseSelect" style="color:#a0a8b4; font-size:0.85rem;">Course</label>
+      <select id="lipilaCourseSelect" class="pay-input" onchange="lipilaCourseChanged()" aria-label="Course">
+        <option value="" disabled selected>Loading...</option>
+      </select>
+    </div>
+    <div class="form-group">
+      <label for="lipilaTermSelect" style="color:#a0a8b4; font-size:0.85rem;">Term</label>
+      <select id="lipilaTermSelect" class="pay-input" onchange="lipilaTermChanged()" disabled aria-label="Term">
+        <option value="" disabled selected>Select Course First</option>
+      </select>
+    </div>
+  </div>
+
+  <div class="form-group"><label style="color:#a0a8b4; font-size:0.85rem;">Full Name</label>
+    <input type="text" id="lipilaFullName" class="pay-input" placeholder="e.g. Chanda Bwalya" autocomplete="name">
+  </div>
+  <div class="form-group"><label style="color:#a0a8b4; font-size:0.85rem;">Email Address</label>
+    <input type="email" id="lipilaEmail" class="pay-input" placeholder="you@email.com" autocomplete="email">
+    <small style="color:#8892b0; font-size:0.78rem;">Your access code is sent here.</small>
+  </div>
+  <div class="form-group"><label style="color:#a0a8b4; font-size:0.85rem;">Mobile Money Number</label>
+    <input type="tel" id="lipilaPhone" class="pay-input" placeholder="097XXXXXXX" autocomplete="tel">
+    <small style="color:#8892b0; font-size:0.78rem;">MTN · Airtel · Zamtel</small>
+  </div>
+
+  <div class="price-box" style="display:block;">
+    <div style="display:flex; justify-content:space-between; align-items:center;">
+      <span style="color:#a0a8b4;">Amount due:</span>
+      <span id="lipilaAmount" style="font-weight:700; color:#72efdd; font-size:1.2rem;">K—</span>
+    </div>
+    <div style="display:flex; justify-content:space-between; align-items:center; margin-top:6px;">
+      <span style="color:#a0a8b4; font-size:0.9em;">Access duration:</span>
+      <span id="lipilaDuration" style="color:#72efdd; font-size:0.9em;">—</span>
+    </div>
+    <div id="lipilaDevicesRow" style="display:none; justify-content:space-between; align-items:center; margin-top:6px;">
+      <span style="color:#a0a8b4; font-size:0.9em;">Devices allowed:</span>
+      <span id="lipilaDevices" style="color:#72efdd; font-size:0.9em;">—</span>
+    </div>
+  </div>
+  <div id="lipilaPriceNote" role="status" aria-live="polite" style="display:none; color:#ffc107; font-size:0.82rem; margin:-4px 0 12px;"></div>
+
+  <button type="button" class="btn pay-btn" id="lipilaPayBtn" disabled onclick="initiateLipila()" style="background:#007bff;">
+    Select course &amp; term
+  </button>
+  <p style="color:#8892b0; text-align:center; font-size:0.78rem; margin-top:10px;">🔒 Secure payment powered by Lipila</p>
+</div>
+
+<!-- ═══ PIN WAITING ═══ -->
+<div id="lipilaPinWaiting" class="hidden" style="text-align:center;">
+  <div style="font-size:3rem; margin-bottom:12px;">📱</div>
+  <h3 style="color:#fff; margin-bottom:8px;">Check your phone</h3>
+  <p style="color:#a0a8b4; margin-bottom:20px;">We sent a payment request to <strong id="lipilaPhoneMasked" style="color:#72efdd;">—</strong></p>
+  <p style="color:#fff; margin-bottom:20px;">Confirm <strong id="lipilaAmountConfirm">K—</strong> with your PIN in your mobile money app.</p>
+  <div style="background:#0d1b2a; border-radius:8px; padding:16px; margin-bottom:16px;">
+    <div style="color:#72efdd; font-weight:700; margin-bottom:8px;">⏳ Waiting for confirmation…</div>
+    <div id="lipilaCountdown" style="color:#a0a8b4; font-size:0.9em;">Expires in —</div>
+    <div id="lipilaTransientIndicator" class="hidden" style="color:#ffc107; font-size:0.82em; margin-top:8px;">⚠️ Network slow — still checking…</div>
+  </div>
+  <button class="cancel-pay-btn" onclick="closePaymentModal()">Cancel payment</button>
+</div>
+
+<!-- ═══ SUCCESS ═══ -->
+<div id="lipilaSuccess" class="hidden" style="text-align:center;">
+  <div style="font-size:3rem; margin-bottom:12px;">✅</div>
+  <h3 style="color:#fff; margin-bottom:8px;">Payment received!</h3>
+  <p style="color:#a0a8b4; margin-bottom:20px;" id="lipilaSuccessScope">—</p>
+  <p style="color:#a0a8b4; margin-bottom:8px;">Your access code:</p>
+  <div class="code-with-copy" style="margin-bottom:16px;">
+    <span class="code-text" id="lipilaSuccessCode">—</span>
+    <button class="copy-btn" onclick="copyLipilaCode(this)">Copy</button>
+  </div>
+  <p style="color:#8892b0; font-size:0.85rem; margin-bottom:20px;">📧 Also sent to <span id="lipilaSuccessEmail">—</span></p>
+  <button class="btn" onclick="useLipilaCodeNow()" style="background:#28a745; margin-bottom:10px;">Use this code now →</button>
+  <button class="cancel-pay-btn" onclick="closePaymentModal()">Done</button>
+</div>
+
+<!-- ═══ FAILED ═══ -->
+<div id="lipilaFailed" class="hidden" style="text-align:center;">
+  <div style="font-size:3rem; margin-bottom:12px;">❌</div>
+  <h3 style="color:#fff; margin-bottom:8px;">Payment not completed</h3>
+  <p style="color:#a0a8b4; margin-bottom:20px;" id="lipilaFailedReason">No money was taken.</p>
+  <button class="btn" onclick="retryLipila()" style="background:#28a745; margin-bottom:10px;">Try again</button>
+  <button class="btn btn-secondary" onclick="fallbackToManual()" style="margin-bottom:10px;">Use screenshot upload instead →</button>
+  <button class="cancel-pay-btn" onclick="closePaymentModal()">Done</button>
+</div>
+
+<!-- ═══ HELD ═══ -->
+<div id="lipilaHeld" class="hidden" style="text-align:center;">
+  <div style="font-size:3rem; margin-bottom:12px;">⏳</div>
+  <h3 style="color:#fff; margin-bottom:8px;">Payment received — code on its way</h3>
+  <p style="color:#a0a8b4; margin-bottom:20px;">Your payment was received. Our team is completing your access code right now. You'll get it by email shortly.</p>
+  <p style="color:#72efdd; font-weight:700; margin-bottom:20px;">You do NOT need to pay again.</p>
+  <button class="btn btn-secondary" onclick="switchPayTab('status'); closePaymentModal();">Check status later →</button>
+  <button class="cancel-pay-btn" onclick="closePaymentModal()">Done</button>
+</div>
+
+<!-- ═══ EXPIRED ═══ -->
+<div id="lipilaExpired" class="hidden" style="text-align:center;">
+  <div style="font-size:3rem; margin-bottom:12px;">⏱️</div>
+  <h3 style="color:#fff; margin-bottom:8px;">Payment request expired</h3>
+  <p style="color:#a0a8b4; margin-bottom:12px;">We didn't receive a confirmation.</p>
+  <p style="color:#ffc107; margin-bottom:20px; font-size:0.9em;">If you confirmed just now, your code will still arrive by email in a few minutes. Check your inbox before trying again — avoid paying twice.</p>
+  <button class="btn" onclick="switchPayTab('status'); closePaymentModal();" style="background:#007bff; margin-bottom:10px;">Check status →</button>
+  <button class="btn btn-secondary" onclick="retryLipila()" style="margin-bottom:10px;">Try again</button>
+  <button class="btn btn-secondary" onclick="fallbackToManual()" style="margin-bottom:10px;">Use screenshot upload instead →</button>
+  <button class="cancel-pay-btn" onclick="closePaymentModal()">Done</button>
+</div>
+    
 
       <!-- Tabs -->
       <div class="tabs">
@@ -1890,7 +2026,7 @@
       </div>
 
       <!-- Tab 1: Submit Payment -->
-      <div id="pay-view">
+      <div id="pay-view" class="hidden">
         <!-- Loading skeleton -->
         <div id="init-loader"><div class="skeleton" style="height:80px;"></div></div>
 
@@ -2130,7 +2266,7 @@
 
   <div id="printable-summary"></div>
 
-  <!-- EXTERNAL ASSETS -->
+  <!-- EXTERNAL ASSETS --> 
   <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
 
 

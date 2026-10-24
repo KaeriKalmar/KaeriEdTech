@@ -28,7 +28,7 @@ const KAERI_CONFIG = {
     gatekeeperUrl:      "https://script.google.com/macros/s/AKfycbyEgfRxU4Z6kdehvNcJloabFmwldB9CExr26G9SNHSGppTVIeGTMKFYAPz-x-eSCXuiVg/exec",
     
     // 2. AMB-PAY Backend (Payments, Config, Bridge)
-    ambPayUrl:          "https://script.google.com/macros/s/AKfycbwugCDutxPSDcKYRqd94x72vmC_EayLWk-JshXZKGYEvypG7iBAtAEEWOFkj9h-OmoQsw/exec",
+    ambPayUrl:          "https://script.google.com/macros/s/AKfycbwGp6ripudldEFja6W6K1CuunPMG5h5E5_P_2jO95PirDS0OQYrH2LTPAyOb35gZXOvxQ/exec",
 
     // Ambassador cross-app.
     ambassadorPortalUrl: "AMB-PORTAL.html", 
@@ -1599,6 +1599,71 @@ function openPaymentModal(intent) {
     if (termName) termName.textContent = (c && t) ? payScopeLabel(c, t) : 'Choose what to unlock';
     _showPayHeader(c, t);
 
+    // ─── LIPILA: reset all views and initialize state ───
+    window._lipilaCtx = {
+        course: c,
+        term: t,
+        saleId: null, email: null, timer: null, countdown: null,
+        amount: null,
+        lipilaEnabled: false,
+        pollIntervalMs: 5000,
+        abandonTimeoutMinutes: 15
+    };
+    ['payMethodSelector','lipilaFormView','lipilaPinWaiting','lipilaSuccess','lipilaFailed','lipilaHeld','lipilaExpired'].forEach(function(id){
+        var el = document.getElementById(id);
+        if (el) el.classList.add('hidden');
+    });
+    var payViewEl = document.getElementById('pay-view');
+    var statusViewEl = document.getElementById('status-view');
+    var tabsEl = document.querySelector('.tabs');
+    if (payViewEl) payViewEl.classList.add('hidden');
+    if (statusViewEl) statusViewEl.classList.add('hidden');
+    if (tabsEl) tabsEl.style.display = 'none';
+
+    // Ask backend whether Lipila is available; decide which view to show
+    callPaymentApi('getPaymentOptions', {}).then(function(res){
+        window._lipilaCtx.lipilaEnabled = !!(res && res.lipilaEnabled);
+        window._lipilaCtx.pollIntervalMs = (res && res.pollIntervalMs) || 5000;
+        window._lipilaCtx.abandonTimeoutMinutes = (res && res.abandonTimeoutMinutes) || 15;
+
+        // Try to resume an in-flight Lipila payment for the same course/term
+        var pendingId = sessionStorage.getItem('lipila_pending_saleId');
+        var pendingEmail = sessionStorage.getItem('lipila_pending_email');
+        var pendingCourse = sessionStorage.getItem('lipila_pending_course');
+        var pendingTerm = sessionStorage.getItem('lipila_pending_term');
+
+        // A payment already in flight always wins over the current selection (prevents double charges).
+        if (pendingId && pendingEmail) {
+            window._lipilaCtx.saleId = pendingId;
+            window._lipilaCtx.email = pendingEmail;
+            if (pendingCourse) window._lipilaCtx.course = pendingCourse;
+            if (pendingTerm) window._lipilaCtx.term = pendingTerm;
+            document.getElementById('lipilaPinWaiting').classList.remove('hidden');
+            document.getElementById('lipilaPhoneMasked').textContent =
+                '••• ••• ' + (sessionStorage.getItem('lipila_pending_phone') || '').slice(-4);
+            document.getElementById('lipilaAmountConfirm').textContent =
+                'K' + (sessionStorage.getItem('lipila_pending_amount') || '0.00');
+            startLipilaPolling(parseInt(sessionStorage.getItem('lipila_pending_started') || '0', 10) || 0);
+            return;
+        }
+
+        // Normal flow
+        if (window._lipilaCtx.lipilaEnabled) {
+            document.getElementById('payMethodSelector').classList.remove('hidden');
+        } else {
+            if (tabsEl) tabsEl.style.display = '';
+            if (payViewEl) payViewEl.classList.remove('hidden');
+            var form = document.getElementById('paymentForm');
+            if (form) form.classList.remove('hidden');
+        }
+    }).catch(function(){
+        // If getPaymentOptions fails, fall back to manual only
+        if (tabsEl) tabsEl.style.display = '';
+        if (payViewEl) payViewEl.classList.remove('hidden');
+        var form = document.getElementById('paymentForm');
+        if (form) form.classList.remove('hidden');
+    });
+
     // Loads (or reuses) live prices, fills the dropdowns and applies purchaseIntent.
     loadCourses();
 
@@ -1614,9 +1679,12 @@ function openPaymentModal(intent) {
 // === REPLACED: closePaymentModal with idempotency reset ===
 // ============================================================
 function closePaymentModal() {
+    // Stop any in-flight Lipila polling
+    stopLipilaTimers();
+
     const modal = document.getElementById('payment-modal');
     if (modal) modal.classList.remove('show');
-    
+
     // Reset the subscription guide (idempotency)
     const guide = document.getElementById('subscription-guide');
     if (guide) guide.removeAttribute('open');
@@ -1871,6 +1939,428 @@ function updatePrice() {
         _showPayHeader('', '');
     }
     updatePlanCards();
+    lipilaSyncFromForm();
+}
+
+
+// ═══════════════════════════════════════════════════════════
+// ═══ LIPILA FRONTEND FUNCTIONS ═══
+// ═══════════════════════════════════════════════════════════
+
+/** Local shims — safe even if toast / isValidZambianMobile don't exist elsewhere */
+function _lipilaToast(msg, type) {
+    return showAppNotification(String(msg || ''), type || 'info');
+}
+function _lipilaValidPhone(p) {
+    return /^(\+260|0)(9[5-7]|7[5-7])\d{7}$/.test(String(p || '').replace(/[\s-]/g, ''));
+}
+
+function selectPaymentMethod(method) {
+    var payViewEl = document.getElementById('pay-view');
+    var tabsEl = document.querySelector('.tabs');
+    var form = document.getElementById('paymentForm');
+
+    document.getElementById('payMethodSelector').classList.add('hidden');
+
+    if (method === 'lipila') {
+        if (payViewEl) payViewEl.classList.add('hidden');
+        if (tabsEl) tabsEl.style.display = 'none';
+        document.getElementById('lipilaFormView').classList.remove('hidden');
+
+        // Prefill what we know (never overwrite what the student already typed)
+        var em = document.getElementById('lipilaEmail');
+        var knownEmail = localStorage.getItem('student_email') || sessionStorage.getItem('student_email') || '';
+        var manualEmail = form && form.querySelector('input[name="email"]');
+        if (em && !em.value) em.value = knownEmail || (manualEmail && manualEmail.value) || '';
+        var nm = document.getElementById('lipilaFullName');
+        var manualName = form && form.querySelector('input[name="fullName"]');
+        if (nm && !nm.value && manualName && manualName.value) nm.value = manualName.value;
+
+        lipilaSyncFromForm();
+        lipilaFetchPrice();
+    } else {
+        // Manual path — restore tabs and show the manual form (selection is shared, so it is already in place)
+        document.getElementById('lipilaFormView').classList.add('hidden');
+        if (tabsEl) tabsEl.style.display = '';
+        if (payViewEl) payViewEl.classList.remove('hidden');
+        if (form) form.classList.remove('hidden');
+        // Carry details typed in the Lipila form over to the screenshot form
+        var le = document.getElementById('lipilaEmail'), ln = document.getElementById('lipilaFullName');
+        if (form && le && le.value) { var me = form.querySelector('input[name="email"]'); if (me && !me.value) me.value = le.value; }
+        if (form && ln && ln.value) { var mn = form.querySelector('input[name="fullName"]'); if (mn && !mn.value) mn.value = ln.value; }
+    }
+}
+
+function backToMethodSelector() {
+    document.getElementById('lipilaFormView').classList.add('hidden');
+    document.getElementById('payMethodSelector').classList.remove('hidden');
+}
+
+/* ── Course / Term for BOTH payment methods ──────────────────────────────
+   The screenshot form's #courseSelect / #termSelect are the single source of
+   truth. The Lipila selects are a live mirror of them: changing either pair
+   updates the other, the header, the plan cards and the price boxes.        */
+
+function _lipilaPriceNote(msg) {
+    var n = document.getElementById('lipilaPriceNote');
+    if (!n) return;
+    n.textContent = msg || '';
+    n.style.display = msg ? 'block' : 'none';
+}
+
+function _lipilaPayBtnRender() {
+    var btn = document.getElementById('lipilaPayBtn');
+    if (!btn) return;
+    var ctx = window._lipilaCtx || {};
+    var ready = !!(ctx.course && ctx.term);
+    if (!ready) { btn.disabled = true; btn.textContent = 'Select course & term'; return; }
+    if (typeof ctx.amount === 'number') { btn.disabled = false; btn.textContent = 'Pay K' + ctx.amount.toFixed(2); return; }
+    btn.disabled = true;
+    btn.textContent = ctx.priceError ? 'Price unavailable' : 'Checking price…';
+}
+
+function lipilaSyncFromForm() {
+    var cs = document.getElementById('courseSelect'), ts = document.getElementById('termSelect');
+    var lcs = document.getElementById('lipilaCourseSelect'), lts = document.getElementById('lipilaTermSelect');
+    if (!cs || !ts || !lcs || !lts || !window._lipilaCtx) return;
+    var ctx = window._lipilaCtx;
+
+    if (lcs.innerHTML !== cs.innerHTML) lcs.innerHTML = cs.innerHTML;
+    lcs.value = cs.value || '';
+    if (lts.innerHTML !== ts.innerHTML) lts.innerHTML = ts.innerHTML;
+    lts.disabled = ts.disabled;
+    lts.value = ts.value || '';
+
+    var course = cs.value || '', term = ts.value || '';
+    var changed = (ctx.course !== course || ctx.term !== term);
+    ctx.course = course; ctx.term = term;
+    if (changed) { ctx.amount = null; ctx.priceError = false; }
+
+    var ready = !!(course && term);
+    var price = ready ? getPriceFor(course, term) : null;
+    var days = ready ? getDurationFor(course, term) : null;
+    var devices = ready ? getMaxDevicesFor(course, term) : null;
+    var amtEl = document.getElementById('lipilaAmount');
+    if (amtEl) amtEl.textContent = price !== null ? 'K' + price.toFixed(2) : 'K—';
+    var durEl = document.getElementById('lipilaDuration');
+    if (durEl) durEl.textContent = (price !== null && days) ? formatDays(days) + ' (starts on first use)' : '—';
+    var devRow = document.getElementById('lipilaDevicesRow'), devEl = document.getElementById('lipilaDevices');
+    if (devRow) devRow.style.display = (price !== null && devices) ? 'flex' : 'none';
+    if (devEl) devEl.textContent = devices ? devices + (devices === 1 ? ' device' : ' devices') : '—';
+    if (ready && price === null && SYSTEM_CONFIG.loaded) _lipilaPriceNote('This plan is not available right now. Choose another option.');
+    else if (!ctx.priceError) _lipilaPriceNote('');
+
+    _lipilaPayBtnRender();
+
+    // Re-confirm the authoritative price whenever the choice changes while the Lipila form is on screen.
+    var view = document.getElementById('lipilaFormView');
+    if (changed && ready && ctx.lipilaEnabled && view && !view.classList.contains('hidden')) lipilaFetchPrice();
+}
+
+function lipilaCourseChanged() {
+    var v = document.getElementById('lipilaCourseSelect').value;
+    var cs = document.getElementById('courseSelect');
+    if (!cs || !v) return;
+    cs.value = v;
+    updateTerms();            // rebuilds terms, calls updatePrice → mirrors back here
+}
+
+function lipilaTermChanged() {
+    var v = document.getElementById('lipilaTermSelect').value;
+    var ts = document.getElementById('termSelect');
+    if (!ts || !v) return;
+    ts.value = v;
+    updatePrice();
+}
+
+var _lipilaPriceTimer = null, _lipilaPriceSeq = 0;
+function lipilaFetchPrice() {
+    var ctx = window._lipilaCtx;
+    if (!ctx) return;
+    clearTimeout(_lipilaPriceTimer);
+    if (!ctx.course || !ctx.term) { _lipilaPayBtnRender(); return; }
+    var seq = ++_lipilaPriceSeq, course = ctx.course, term = ctx.term;
+    ctx.amount = null; ctx.priceError = false;
+    _lipilaPayBtnRender();
+    _lipilaPriceTimer = setTimeout(function () {
+        callPaymentApi('getLipilaPrice', { course: course, term: term }, 2)
+            .then(function (res) {
+                if (seq !== _lipilaPriceSeq) return;            // a newer choice superseded this answer
+                if (res && res.success && typeof res.amount === 'number') {
+                    ctx.amount = res.amount; ctx.priceError = false;
+                    var amtEl = document.getElementById('lipilaAmount');
+                    if (amtEl) amtEl.textContent = 'K' + res.amount.toFixed(2);
+                    _lipilaPriceNote('');
+                } else {
+                    ctx.priceError = true;
+                    _lipilaPriceNote((res && res.message) || 'Instant payment is not available for this plan. Choose another, or pay by screenshot.');
+                }
+                _lipilaPayBtnRender();
+            })
+            .catch(function () {
+                if (seq !== _lipilaPriceSeq) return;
+                ctx.priceError = true;
+                _lipilaPriceNote('Could not confirm the price. Check your connection and re-select the term to retry.');
+                _lipilaPayBtnRender();
+            });
+    }, 200);
+}
+
+function _lipilaAskPriceChange(oldAmt, newAmt, msg) {
+    var text = msg || ('The price is now K' + newAmt.toFixed(2) + (typeof oldAmt === 'number' ? ' (was K' + oldAmt.toFixed(2) + ')' : '') + '. Continue?');
+    if (typeof Swal === 'undefined') return Promise.resolve(window.confirm(text));
+    return Swal.fire({
+        icon: 'question', title: 'Price updated', text: text,
+        showCancelButton: true, confirmButtonText: 'Pay K' + newAmt.toFixed(2), cancelButtonText: 'Cancel',
+        background: '#1b263b', color: '#e0e6ed', confirmButtonColor: '#007bff',
+        backdrop: 'rgba(13,27,42,0.85)'
+    }).then(function (r) { return !!r.isConfirmed; });
+}
+
+function initiateLipila(confirmedAmount) {
+    var ctx = window._lipilaCtx;
+    var name = (document.getElementById('lipilaFullName').value || '').trim();
+    var email = (document.getElementById('lipilaEmail').value || '').trim().toLowerCase();
+    var phone = (document.getElementById('lipilaPhone').value || '').trim();
+    if (!ctx.course) return _lipilaToast('Select a course', 'warning');
+    if (!ctx.term) return _lipilaToast('Select a term', 'warning');
+    if (!name) return _lipilaToast('Enter your full name', 'warning');
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return _lipilaToast('Enter a valid email', 'warning');
+    if (!_lipilaValidPhone(phone)) return _lipilaToast('Enter a valid Zambian mobile number', 'warning');
+    if (typeof ctx.amount !== 'number') return _lipilaToast('Still confirming the price — try again in a moment', 'info');
+
+    var course = ctx.course, term = ctx.term, sentAmount = ctx.amount;
+    var btn = document.getElementById('lipilaPayBtn');
+    if (btn.dataset.busy === '1') return;
+    btn.dataset.busy = '1';
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span>Starting…';
+    var release = function () { btn.dataset.busy = '0'; _lipilaPayBtnRender(); };
+
+    callPaymentApi('initiateLipilaPayment', {
+        fullName: name, email: email, course: course, term: term,
+        phone: phone, expectedAmount: sentAmount
+    }, 3).then(function(res){
+        if (res && res.success) {
+            btn.dataset.busy = '0';
+            ctx.saleId = res.saleId;
+            ctx.email = email;
+            var started = Date.now();
+            try {
+                sessionStorage.setItem('lipila_pending_saleId', res.saleId);
+                sessionStorage.setItem('lipila_pending_email', email);
+                sessionStorage.setItem('lipila_pending_course', course);
+                sessionStorage.setItem('lipila_pending_term', term);
+                sessionStorage.setItem('lipila_pending_phone', phone);
+                sessionStorage.setItem('lipila_pending_amount', Number(res.amount).toFixed(2));
+                sessionStorage.setItem('lipila_pending_started', String(started));
+                sessionStorage.setItem('student_email', email);
+                localStorage.setItem('student_email', email);
+            } catch (e) {}
+            if (res.pollIntervalMs) ctx.pollIntervalMs = res.pollIntervalMs;
+            if (res.abandonTimeoutMinutes) ctx.abandonTimeoutMinutes = res.abandonTimeoutMinutes;
+
+            document.getElementById('lipilaFormView').classList.add('hidden');
+            document.getElementById('lipilaPinWaiting').classList.remove('hidden');
+            document.getElementById('lipilaPhoneMasked').textContent =
+                res.phoneMasked || ('••• ••• ' + phone.slice(-4));
+            document.getElementById('lipilaAmountConfirm').textContent = 'K' + Number(res.amount).toFixed(2);
+            if (res.reused) _lipilaToast('You already had a payment request open for this plan — resuming it.', 'info');
+            startLipilaPolling(started);
+            return;
+        }
+        if (res && res.code === 'PRICE_CHANGED' && typeof res.newAmount === 'number') {
+            release();
+            _lipilaAskPriceChange(sentAmount, res.newAmount, res.message).then(function (ok) {
+                if (ok) { ctx.amount = res.newAmount; var a = document.getElementById('lipilaAmount'); if (a) a.textContent = 'K' + res.newAmount.toFixed(2); _lipilaPayBtnRender(); initiateLipila(); }
+                else { lipilaFetchPrice(); }
+            });
+            return;
+        }
+        if (res && (res.code === 'LIPILA_UNAVAILABLE' || res.code === 'LIPILA_DOWN' || res.fallbackToManual)) {
+            release();
+            _lipilaToast(res.message || 'Instant payment is unavailable right now — switching to the screenshot option', 'warning');
+            setTimeout(function(){ selectPaymentMethod('manual'); }, 1200);
+            return;
+        }
+        release();
+        _lipilaToast((res && res.message) || 'Could not start payment', 'error');
+    }).catch(function(){
+        release();
+        _lipilaToast('Connection error. Please try again.', 'error');
+    });
+}
+
+function startLipilaPolling(startedAt) {
+    var ctx = window._lipilaCtx;
+    stopLipilaTimers();                 // bumps ctx._gen so any older poll chain dies
+
+    // Countdown from a wall-clock deadline (accurate even when the tab was throttled in the background)
+    var total = (ctx.abandonTimeoutMinutes || 15) * 60;
+    var started = startedAt || Date.now();
+    var left = function () { return Math.max(0, total - Math.floor((Date.now() - started) / 1000)); };
+    updateLipilaCountdown(left());
+    ctx.countdown = setInterval(function(){ updateLipilaCountdown(left()); }, 1000);
+
+    var transient = 0, inFlight = false, saleId = ctx.saleId, gen = ctx._gen;
+    var ind = function (on) {
+        var el = document.getElementById('lipilaTransientIndicator');
+        if (el) el.classList.toggle('hidden', !on);
+    };
+    function schedule() {
+        if (ctx.saleId !== saleId || ctx._gen !== gen) return;
+        // Back off after repeated hiccups; stay slow while the tab is hidden.
+        var base = ctx.pollIntervalMs || 5000;
+        var delay = transient >= 3 ? Math.max(base * 3, 15000) : (document.hidden ? Math.max(base * 3, 15000) : base);
+        ctx.timer = setTimeout(poll, delay);
+    }
+    function poll() {
+        if (ctx.saleId !== saleId || ctx._gen !== gen || inFlight) return;
+        inFlight = true;
+        callPaymentApi('checkLipilaPayment', { saleId: saleId, email: ctx.email }, 1)
+            .then(function(res){
+                inFlight = false;
+                if (ctx.saleId !== saleId) return;
+                if (!res || res.transient) { transient++; ind(true); return schedule(); }
+                transient = 0; ind(false);
+                if (res.status === 'completed') return showLipilaSuccess(res);
+                if (res.status === 'failed') return showLipilaFailed(res);
+                if (res.status === 'held') return showLipilaHeld(res);
+                if (res.status === 'expired') return showLipilaExpired(res);
+                schedule();                                   // 'pending' → keep polling
+            })
+            .catch(function(){
+                inFlight = false;
+                if (ctx.saleId !== saleId) return;
+                transient++; ind(true); schedule();
+            });
+    }
+    ctx._poll = poll;
+    poll();
+}
+
+// Check straight away when the student returns to the tab after approving on their phone.
+document.addEventListener('visibilitychange', function () {
+    var ctx = window._lipilaCtx;
+    if (!document.hidden && ctx && ctx.saleId && ctx.timer && typeof ctx._poll === 'function') {
+        clearTimeout(ctx.timer);
+        ctx._poll();
+    }
+});
+
+function updateLipilaCountdown(seconds) {
+    var el = document.getElementById('lipilaCountdown');
+    if (!el) return;
+    if (seconds <= 0) { el.textContent = 'Finalising — this can take a moment…'; return; }
+    var m = Math.floor(seconds / 60), s = seconds % 60;
+    el.textContent = 'Expires in ' + m + ':' + (s < 10 ? '0' : '') + s;
+}
+
+function stopLipilaTimers() {
+    if (window._lipilaCtx) {
+        window._lipilaCtx._gen = (window._lipilaCtx._gen || 0) + 1;
+        if (window._lipilaCtx.timer) { clearTimeout(window._lipilaCtx.timer); window._lipilaCtx.timer = null; }
+        if (window._lipilaCtx.countdown) { clearInterval(window._lipilaCtx.countdown); window._lipilaCtx.countdown = null; }
+    }
+}
+
+function clearLipilaSession() {
+    sessionStorage.removeItem('lipila_pending_saleId');
+    sessionStorage.removeItem('lipila_pending_email');
+    sessionStorage.removeItem('lipila_pending_course');
+    sessionStorage.removeItem('lipila_pending_term');
+    sessionStorage.removeItem('lipila_pending_phone');
+    sessionStorage.removeItem('lipila_pending_amount');
+    sessionStorage.removeItem('lipila_pending_started');
+}
+
+function showLipilaSuccess(res) {
+    stopLipilaTimers();
+    clearLipilaSession();
+    document.getElementById('lipilaPinWaiting').classList.add('hidden');
+    document.getElementById('lipilaSuccess').classList.remove('hidden');
+    document.getElementById('lipilaSuccessCode').textContent = res.code || '—';
+    document.getElementById('lipilaSuccessScope').textContent =
+        (typeof res.amount === 'number' ? 'K' + res.amount.toFixed(2) + ' · ' : '') +
+        (res.course ? payScopeLabel(_up(res.course), _up(res.term)) : '');
+    document.getElementById('lipilaSuccessEmail').textContent = window._lipilaCtx.email || '';
+}
+
+function showLipilaFailed(res) {
+    stopLipilaTimers();
+    clearLipilaSession();
+    document.getElementById('lipilaPinWaiting').classList.add('hidden');
+    document.getElementById('lipilaFailed').classList.remove('hidden');
+    document.getElementById('lipilaFailedReason').textContent =
+        res.message || 'No money was taken. Please try again or use the screenshot option.';
+}
+
+function showLipilaHeld(res) {
+    stopLipilaTimers();
+    clearLipilaSession();
+    document.getElementById('lipilaPinWaiting').classList.add('hidden');
+    document.getElementById('lipilaHeld').classList.remove('hidden');
+}
+
+function showLipilaExpired(res) {
+    stopLipilaTimers();
+    clearLipilaSession();
+    document.getElementById('lipilaPinWaiting').classList.add('hidden');
+    document.getElementById('lipilaExpired').classList.remove('hidden');
+}
+
+function copyLipilaCode(btn) {
+    var code = document.getElementById('lipilaSuccessCode').textContent;
+    if (!code || code === '—') return;
+    navigator.clipboard.writeText(code).then(function(){
+        btn.textContent = '✓ Copied';
+        setTimeout(function(){ btn.textContent = 'Copy'; }, 2000);
+    }).catch(function(){
+        var ta = document.createElement('textarea');
+        ta.value = code; document.body.appendChild(ta); ta.select();
+        try {
+            document.execCommand('copy');
+            btn.textContent = '✓ Copied';
+            setTimeout(function(){ btn.textContent = 'Copy'; }, 2000);
+        } catch(e) {}
+        document.body.removeChild(ta);
+    });
+}
+
+function useLipilaCodeNow() {
+    var code = document.getElementById('lipilaSuccessCode').textContent;
+    closePaymentModal();
+    setTimeout(function(){
+        var input = document.getElementById('access-code-input');
+        if (input) { input.value = code; input.focus(); }
+    }, 300);
+}
+
+function retryLipila() {
+    document.getElementById('lipilaFailed').classList.add('hidden');
+    document.getElementById('lipilaExpired').classList.add('hidden');
+    document.getElementById('lipilaHeld').classList.add('hidden');
+    document.getElementById('lipilaFormView').classList.remove('hidden');
+    var payViewEl = document.getElementById('pay-view');
+    var tabsEl = document.querySelector('.tabs');
+    if (payViewEl) payViewEl.classList.add('hidden');
+    if (tabsEl) tabsEl.style.display = 'none';
+    window._lipilaCtx.saleId = null;
+    lipilaSyncFromForm();
+    lipilaFetchPrice();
+}
+
+function fallbackToManual() {
+    document.getElementById('lipilaFailed').classList.add('hidden');
+    document.getElementById('lipilaExpired').classList.add('hidden');
+    document.getElementById('lipilaHeld').classList.add('hidden');
+    document.getElementById('lipilaFormView').classList.add('hidden');
+    var payViewEl = document.getElementById('pay-view');
+    var tabsEl = document.querySelector('.tabs');
+    var form = document.getElementById('paymentForm');
+    if (payViewEl) payViewEl.classList.remove('hidden');
+    if (tabsEl) tabsEl.style.display = '';
+    if (form) form.classList.remove('hidden');
 }
 
 
@@ -2010,8 +2500,14 @@ function checkHistory() {
                 return;
             }
             data.forEach(item => {
-                const badgeClass = item.status === 'Completed' ? 'badge-success' :
-                                   item.status === 'Failed' ? 'badge-danger' : 'badge-warning';
+                const st = String(item.status || '');
+                const badgeClass = st === 'Completed' ? 'badge-success' :
+                                   (st === 'Failed' || st === 'Abandoned' || st === 'Timed_Out_Unconfirmed') ? 'badge-danger' : 'badge-warning';
+                const statusLabel = ({
+                    'Pending_Lipila': 'Processing', 'Paid_Pending_Review': 'Under review', 'Paid_Code_Failed': 'Under review',
+                    'Disputed': 'Under review', 'Timed_Out_Unconfirmed': 'Expired', 'Abandoned': 'Expired'
+                })[st] || st;
+                const methodLabel = item.paymentMethod === 'LIPILA' || item.paymentMethod === 'Lipila' || item.saleId ? '💳 Lipila' : '📱 Screenshot';
                 let contentHtml = '';
                 if (item.status === 'Completed' && item.accessCode) {
                     contentHtml = `
@@ -2024,6 +2520,11 @@ function checkHistory() {
                     `;
                 } else if (item.status === 'Failed') {
                     contentHtml = `<div style="color:#8899a6;font-size:0.85rem;margin-top:5px;">${escapeHtml(item.verificationNotes || 'Failed')}</div>`;
+                } else if (st === 'Pending_Lipila') {
+                    contentHtml = `<div style="color:#8899a6;font-size:0.85rem;margin-top:5px;">Waiting for your PIN confirmation on your phone. Your code will appear here once paid.</div>
+                        <button class="btn btn-inline btn-secondary" style="width:auto;padding:6px 14px;margin-top:8px;" onclick="checkHistory()">↻ Refresh status</button>`;
+                } else if (statusLabel === 'Under review') {
+                    contentHtml = `<div style="color:#8899a6;font-size:0.85rem;margin-top:5px;">${escapeHtml(item.verificationNotes || 'Payment received — our team is confirming it. You will get your code by email.')}</div>`;
                 } else {
                     contentHtml = `<div style="color:#8899a6;font-size:0.85rem;margin-top:5px;">${escapeHtml(item.verificationNotes || 'Pending...')}</div>`;
                 }
@@ -2032,9 +2533,9 @@ function checkHistory() {
                     <div class="history-item">
                         <div style="display:flex;justify-content:space-between;margin-bottom:5px;">
                             <span style="font-weight:700">${escapeHtml(item.course)} ${escapeHtml(item.term)}</span>
-                            <span class="badge ${badgeClass}">${escapeHtml(item.status)}</span>
+                            <span class="badge ${badgeClass}">${escapeHtml(statusLabel)}</span>
                         </div>
-                        <div style="color:#8899a6;font-size:0.85rem;">${escapeHtml(item.date)} • Ref: ${escapeHtml(item.transactionRef || '-')}</div>
+                        <div style="color:#8899a6;font-size:0.85rem;">${escapeHtml(item.date)} • ${methodLabel} • Ref: ${escapeHtml(item.transactionRef || item.saleId || '-')}</div>
                         ${contentHtml}
                     </div>
                 `;
@@ -2101,20 +2602,46 @@ function escapeHtml(str) {
 function switchPayTab(tab) {
     const payView = document.getElementById('pay-view');
     const statusView = document.getElementById('status-view');
-    const tabs = document.querySelectorAll('.tab-btn');
-    
-    tabs.forEach(b => b.classList.remove('active'));
+    const tabButtons = document.querySelectorAll('.tab-btn');
+    const tabsContainer = document.querySelector('.tabs');
+
+    // Hide any visible Lipila screens when switching to a tab view
+    ['payMethodSelector','lipilaFormView','lipilaPinWaiting','lipilaSuccess','lipilaFailed','lipilaHeld','lipilaExpired'].forEach(function(id){
+        var el = document.getElementById(id);
+        if (el) el.classList.add('hidden');
+    });
+
+    // Show the tabs container (may have been hidden by the Lipila method selector)
+    if (tabsContainer) tabsContainer.style.display = '';
+
+    tabButtons.forEach(b => b.classList.remove('active'));
     if (payView) payView.classList.add('hidden');
     if (statusView) statusView.classList.add('hidden');
 
     if (tab === 'pay') {
-        tabs[0]?.classList.add('active');
+        tabButtons[0]?.classList.add('active');
         if (payView) payView.classList.remove('hidden');
     } else {
-        tabs[1]?.classList.add('active');
+        tabButtons[1]?.classList.add('active');
         if (statusView) statusView.classList.remove('hidden');
     }
 }
+
+
+// ═══════════════════════════════════════════════════════════
+// ═══ LIPILA VISIBILITY HANDLER (Patch 3.4) ═══
+// ═══════════════════════════════════════════════════════════
+document.addEventListener('visibilitychange', function(){
+    if (document.hidden && window._lipilaCtx && window._lipilaCtx.timer) {
+        clearInterval(window._lipilaCtx.timer);
+        window._lipilaCtx.timer = null;
+    } else if (!document.hidden && window._lipilaCtx && window._lipilaCtx.saleId && !window._lipilaCtx.timer) {
+        var pinWaiting = document.getElementById('lipilaPinWaiting');
+        if (pinWaiting && !pinWaiting.classList.contains('hidden')) {
+            startLipilaPolling();
+        }
+    }
+});
 // ============================================================
 // === 6. QUIZ ENGINE with Tiered Access ===
 // === v1.1 PATCH: paid MCQ wizard (3 screens) — demo contract untouched ===
@@ -5483,6 +6010,8 @@ document.addEventListener('DOMContentLoaded', function() {
     window.showAlert = showAlert;
     window.openPaymentModal = openPaymentModal;
     window.closePaymentModal = closePaymentModal;
+    window.lipilaCourseChanged = lipilaCourseChanged;
+    window.lipilaTermChanged = lipilaTermChanged;
 
     // 5. CRITICAL: Expose the existing verifyCodeFromModal() so the "Activate Code" button works
     window.verifyCodeFromModal = verifyCodeFromModal;
