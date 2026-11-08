@@ -28,15 +28,16 @@ const KAERI_CONFIG = {
     gatekeeperUrl:      "https://script.google.com/macros/s/AKfycbyEgfRxU4Z6kdehvNcJloabFmwldB9CExr26G9SNHSGppTVIeGTMKFYAPz-x-eSCXuiVg/exec",
     
     // 2. AMB-PAY Backend (Payments, Config, Bridge)
-    ambPayUrl:          "https://script.google.com/macros/s/AKfycbwGp6ripudldEFja6W6K1CuunPMG5h5E5_P_2jO95PirDS0OQYrH2LTPAyOb35gZXOvxQ/exec",
+    ambPayUrl:          "https://script.google.com/macros/s/AKfycbzeN2ZWwnBReNQnvu_1GUr6qZMGmTNUi2e7-byJnFtkJRs6st2LyGyAgBKDwaP9jv5S/exec",
 
     // Ambassador cross-app.
     ambassadorPortalUrl: "AMB-PORTAL.html", 
     ambassadorApiUrl:    "",                
 
     // Limits and timers
-    demoAttemptLimit:           10,
+    demoAttemptLimit:           20,
     revalidationMs:             300000,
+    configSyncMs:               300000,   // silent live-config sync (App Config tab changes reach students within ~5 min)
     revalidationWarmupMs:       5000,
     courseLoadDelayMs:          100,
     paymentRetries:             3,
@@ -61,7 +62,7 @@ const AMBASSADOR_API_URL    = KAERI_CONFIG.ambassadorApiUrl;
 // NOTHING in this file hardcodes a price or a duration. If the live
 // config is not available the UI shows "—" instead of guessing.
 // ============================================================
-let SYSTEM_CONFIG = { inventory: {}, durations: {}, maxDevices: {}, loaded: false, loadedAt: 0, error: '' };
+let SYSTEM_CONFIG = { inventory: {}, durations: {}, maxDevices: {}, demoAttemptLimit: null, loaded: false, loadedAt: 0, error: '' };
 let _configInflight = null;
 const CONFIG_FRESH_MS = 60 * 1000;   // reuse a fetched config for 60s, then refresh in the background
 let purchaseIntent = null;           // { course, term } requested by a plan card, consumed once by renderPaymentForm()
@@ -121,9 +122,15 @@ function payScopeLabel(course, term) {
     return c + ' ' + t;
 }
 
+/** Live demo limit from AppConfig (DemoAttemptLimit). Falls back to the hardcoded default when offline/unset. */
+function getDemoLimit() {
+    const live = SYSTEM_CONFIG && SYSTEM_CONFIG.demoAttemptLimit;
+    return (typeof live === 'number' && isFinite(live) && live >= 0) ? live : KAERI_CONFIG.demoAttemptLimit;
+}
+
 /** Fetch live inventory/durations/maxDevices. Safe to call often (cached + single-flight). */
-function loadSystemConfig(force) {
-    if (!force && SYSTEM_CONFIG.loaded && (Date.now() - SYSTEM_CONFIG.loadedAt) < CONFIG_FRESH_MS) {
+function loadSystemConfig(force, isSilent) {
+    if (!force && !isSilent && SYSTEM_CONFIG.loaded && (Date.now() - SYSTEM_CONFIG.loadedAt) < CONFIG_FRESH_MS) {
         return Promise.resolve(SYSTEM_CONFIG);
     }
     if (_configInflight) return _configInflight;
@@ -133,6 +140,7 @@ function loadSystemConfig(force) {
             SYSTEM_CONFIG.inventory  = res.inventory  || {};
             SYSTEM_CONFIG.durations  = res.durations  || {};
             SYSTEM_CONFIG.maxDevices = res.maxDevices || {};
+            SYSTEM_CONFIG.demoAttemptLimit = (typeof res.demoAttemptLimit === 'number') ? res.demoAttemptLimit : null;
             SYSTEM_CONFIG.loaded = true;
             SYSTEM_CONFIG.loadedAt = Date.now();
             SYSTEM_CONFIG.error = '';
@@ -141,12 +149,29 @@ function loadSystemConfig(force) {
             return SYSTEM_CONFIG;
         })
         .catch(function (err) {
+            if (isSilent) return SYSTEM_CONFIG;   // silent sync: keep the last known config, never surface an error
             SYSTEM_CONFIG.error = (err && err.message) || 'offline';
             throw err;
         })
         .then(function (v) { _configInflight = null; return v; },
               function (e) { _configInflight = null; throw e; });
     return _configInflight;
+}
+
+// Silent background sync: no spinner, no errors shown. Pauses while the tab is hidden.
+let _configSyncTimer = null;
+function startConfigSync() {
+    if (_configSyncTimer) clearInterval(_configSyncTimer);
+    _configSyncTimer = setInterval(function () {
+        if (document.hidden) return;
+        loadSystemConfig(true, true).catch(function () {});
+    }, KAERI_CONFIG.configSyncMs);
+    document.addEventListener('visibilitychange', function () {
+        if (!document.hidden && SYSTEM_CONFIG.loaded &&
+            (Date.now() - SYSTEM_CONFIG.loadedAt) > KAERI_CONFIG.configSyncMs) {
+            loadSystemConfig(true, true).catch(function () {});
+        }
+    });
 }
 
 /** Banner + pricing text inside the course view. Never unhides the banner (full-access users keep it hidden). */
@@ -264,6 +289,7 @@ let currentMcqData = [], currentShortData = [], currentEssayData = [], currentFl
 let currentCourse = null, currentTerm = null, currentTermKey = null;
 let currentQuizType = null, currentQuestionIndex = 0, currentScore = 0, currentQuizData = [];
 let currentEssay = null, currentStepIndex = 0, essayScore = 0;
+let currentEssayIndex = -1; // index into currentEssayData of the running essay (currentEssay is a shuffled copy)
 
 // Flashcard Specific Contexts
 let currentFlashcardTopic = null, currentFlashcards = [], currentCardIndex = 0, isCardFront = true;
@@ -277,9 +303,102 @@ let revalidationInterval = null;
 // === 0. UNIVERSAL PARSER (Markdown -> HTML) ===
 // ============================================================
 
+// ── Pipe tables ────────────────────────────────────────────────
+// GitHub-style tables:   | A | B |   then   |---|:-:|   then the rows.
+// Alignment comes from the separator row (:--- left, :-: centre, --: right).
+// A literal pipe inside a cell is written \|  (needed for things like |x| in maths).
+// NOTE: deliberately free of regex backslashes — this function is embedded (via toString)
+// into the revision-kit print document, so the table logic lives in exactly one place.
+// speech = true returns a plain-text reading of the table instead of HTML (used by read-aloud).
+function kaeriConvertTables(text, inline, speech) {
+    var NL = String.fromCharCode(10), BS = String.fromCharCode(92);
+    var lines = String(text).split(NL);
+    var out = [];
+
+    function splitRow(line) {
+        var s = line.trim(), cells = [], cur = '', i, ch;
+        if (s.charAt(0) === '|') s = s.slice(1);
+        for (i = 0; i < s.length; i++) {
+            ch = s.charAt(i);
+            if (ch === BS && s.charAt(i + 1) === '|') { cur += '|'; i++; }
+            else if (ch === '|') { cells.push(cur.trim()); cur = ''; }
+            else cur += ch;
+        }
+        if (cur.trim() !== '' || cells.length === 0) cells.push(cur.trim());
+        return cells;
+    }
+    function isRow(line) { return line.indexOf('|') !== -1 && line.trim() !== ''; }
+    function isSep(line) {
+        if (line.indexOf('|') === -1) return false;
+        var c = splitRow(line), k;
+        for (k = 0; k < c.length; k++) { if (!/^:?-+:?$/.test(c[k])) return false; }
+        return c.length > 0;
+    }
+    function cellHtml(tag, content, align) {
+        return '<' + tag + ' style="text-align:' + align + '">' + (inline ? inline(content) : content) + '</' + tag + '>';
+    }
+    function tableHtml(head, aligns, rows) {
+        var h = '<div class="kaeri-table-wrap"><table class="kaeri-table"><thead><tr>', k;
+        for (k = 0; k < head.length; k++) h += cellHtml('th', head[k], aligns[k]);
+        h += '</tr></thead><tbody>';
+        rows.forEach(function (r) {
+            h += '<tr>';
+            for (k = 0; k < head.length; k++) h += cellHtml('td', r[k] === undefined ? '' : r[k], aligns[k]);
+            h += '</tr>';
+        });
+        return h + '</tbody></table></div>';
+    }
+    function tableSpeech(head, rows) {
+        var s = 'Table with ' + head.length + (head.length === 1 ? ' column: ' : ' columns: ') + head.join(', ') + '.';
+        rows.forEach(function (r, n) {
+            var parts = [];
+            head.forEach(function (hd, k) { parts.push((hd ? hd + ': ' : '') + (r[k] === undefined ? '' : r[k])); });
+            s += NL + 'Row ' + (n + 1) + ': ' + parts.join(', ') + '.';
+        });
+        return s;
+    }
+
+    var i = 0;
+    while (i < lines.length) {
+        if (isRow(lines[i]) && i + 1 < lines.length && isSep(lines[i + 1])) {
+            var head = splitRow(lines[i]), seps = splitRow(lines[i + 1]);
+            if (head.length === seps.length) {
+                var aligns = seps.map(function (c) {
+                    var l = c.charAt(0) === ':', r = c.charAt(c.length - 1) === ':';
+                    return (l && r) ? 'center' : (r ? 'right' : 'left');
+                });
+                var rows = [], j = i + 2;
+                while (j < lines.length && isRow(lines[j])) { rows.push(splitRow(lines[j])); j++; }
+                if (out.length && out[out.length - 1].trim() === '') out.pop();   // the table brings its own spacing
+                out.push(speech ? tableSpeech(head, rows) : tableHtml(head, aligns, rows));
+                i = j;
+                if (i < lines.length && lines[i].trim() === '') i++;
+                continue;
+            }
+        }
+        out.push(lines[i]);
+        i++;
+    }
+    return out.join(NL);
+}
+
+// Bold / underline / italic — shared by the body text and table cells.
+function _kaeriInline(t) {
+    // Bold (**text**)
+    t = t.replace(/\*\*(.*?)\*\*/g, "<strong>$1</strong>");
+    // Underline (__text__)
+    t = t.replace(/__(.*?)__/g, "<u>$1</u>");
+    // Italic (*text*) - careful regex to avoid breaking Math symbols
+    t = t.replace(/(?<!\\)\*([^\s].*?)(?<!\\)\*/g, "<em>$1</em>");
+    return t;
+}
+
 function parseKaeriMarkdown(text) {
     if (!text) return "";
     let t = text;
+
+    // 0. Tables (| a | b |) — converted first so their rows are not mangled by the rules below
+    t = kaeriConvertTables(t, _kaeriInline);
 
     // 1. Headers (# H1, ## H2)
     t = t.replace(/^## (.*$)/gim, "<h3 style='margin:10px 0; color:#72efdd;'>$1</h3>");
@@ -291,14 +410,8 @@ function parseKaeriMarkdown(text) {
     // 3. Bullet Lists (- item)
     t = t.replace(/^- (.*$)/gim, "<li style='margin-left:20px;'>$1</li>");
 
-    // 4. Bold (**text**)
-    t = t.replace(/\*\*(.*?)\*\*/g, "<strong>$1</strong>");
-
-    // 5. Underline (__text__)
-    t = t.replace(/__(.*?)__/g, "<u>$1</u>");
-
-    // 6. Italic (*text*) - careful regex to avoid breaking Math symbols
-    t = t.replace(/(?<!\\)\*([^\s].*?)(?<!\\)\*/g, "<em>$1</em>");
+    // 4-6. Bold, underline, italic
+    t = _kaeriInline(t);
 
     // 7. Line Breaks (Convert newlines to HTML breaks)
     t = t.replace(/\n/g, "<br>");
@@ -356,6 +469,7 @@ function loadMcqForTermKey(termKey) {
         const existing = document.querySelector('script[data-mcq-term="' + termKey + '"]');
         if (existing) {
             existing.addEventListener('load', function () { resolve(_mcqCache[termKey] || []); });
+            existing.addEventListener('error', function () { resolve([]); });
             return;
         }
 
@@ -369,11 +483,240 @@ function loadMcqForTermKey(termKey) {
                 return !q.flagged && (q.status === undefined || q.status === 'approved');
             });
             _mcqCache[termKey] = usable;
+            _setModeFailed(termKey, 'mcq', false);
             resolve(usable);
         };
-        script.onerror = function () { _mcqCache[termKey] = []; resolve([]); };
+        script.onerror = function () {
+            // A manifest file that won't load is a FAILED load, not "no data": don't cache it,
+            // keep the mode visible and let it retry.
+            script.remove();
+            _setModeFailed(termKey, 'mcq', true);
+            resolve([]);
+        };
         document.head.appendChild(script);
     });
+}
+
+// ── ESSAY PER-TERM LOADER ───────────────────────────────────
+// Essay simulations load from assets/terms/<COURSE>_<TERM>.js, which self-registers on
+// window.__TERM__[termKey].essay (course / term / year are implicit, not on the items).
+// If a term has no file (or no essay in it), fall back to the legacy global essayData.
+const _essayTermCache = {};
+
+function loadEssayForTermKey(termKey, course, term) {
+    return new Promise(function (resolve) {
+        if (_essayTermCache[termKey]) { resolve(_essayTermCache[termKey]); return; }
+
+        function finish(offlineFail) {
+            window.__TERM__ = window.__TERM__ || {};
+            const raw = (window.__TERM__[termKey] || {}).essay;
+            let essays = Array.isArray(raw) ? raw : [];
+            if (essays.length === 0) {
+                essays = filterDataByCourseAndTerm(typeof essayData !== 'undefined' ? essayData : [], course, term);
+            }
+            if (offlineFail === true) { _setModeFailed(termKey, 'essay', true); }   // offline ≠ empty: don't cache
+            else { _essayTermCache[termKey] = essays; _setModeFailed(termKey, 'essay', false); }
+            resolve(essays);
+        }
+
+        const existing = document.querySelector('script[data-term="' + termKey + '"]');
+        if (existing) {
+            if (existing.getAttribute('data-done')) { finish(); return; }
+            existing.addEventListener('load', finish);
+            existing.addEventListener('error', finish);
+            return;
+        }
+
+        const script = document.createElement('script');
+        script.src = 'assets/terms/' + termKey + '.js';
+        script.setAttribute('data-term', termKey);
+        script.onload  = function () { script.setAttribute('data-done', '1'); finish(); };
+        script.onerror = function () {
+            // A missing file is normal (term has no essays yet); being offline is a failed load.
+            if (!navigator.onLine) { script.remove(); finish(true); return; }
+            script.setAttribute('data-done', '1'); finish();
+        };
+        document.head.appendChild(script);
+    });
+}
+
+// ── FLASHCARD PER-TERM LOADER ───────────────────────────────
+// Flashcards load from assets/flashcards/<COURSE>_<TERM>.js (one independent file per term), which
+// self-registers on window.__FLASHCARDS__[termKey] as { "Parent: Child": [ {front, back}, … ] }.
+// Course / term are implicit in the file name. Topic names are the SRS keys — never rename them.
+// If a term has no file (or it is empty), fall back to the legacy global `flashcards` object.
+const _flashcardTermCache = {};
+
+function loadFlashcardsForTermKey(termKey, course, term) {
+    return new Promise(function (resolve) {
+        if (_flashcardTermCache[termKey]) { resolve(_flashcardTermCache[termKey]); return; }
+
+        function finish(offlineFail) {
+            window.__FLASHCARDS__ = window.__FLASHCARDS__ || {};
+            const raw = window.__FLASHCARDS__[termKey];
+            let topics = (raw && typeof raw === 'object') ? raw : {};
+            if (Object.keys(topics).length === 0) {
+                topics = filterFlashcardsByCourseAndTerm(
+                    (typeof allFlashcards !== 'undefined') ? allFlashcards : {}, course, term);
+            }
+            if (offlineFail === true) { _setModeFailed(termKey, 'flashcard', true); }   // offline ≠ empty: don't cache
+            else { _flashcardTermCache[termKey] = topics; _setModeFailed(termKey, 'flashcard', false); }
+            resolve(topics);
+        }
+
+        const existing = document.querySelector('script[data-fc-term="' + termKey + '"]');
+        if (existing) {
+            if (existing.getAttribute('data-done')) { finish(); return; }
+            existing.addEventListener('load', finish);
+            existing.addEventListener('error', finish);
+            return;
+        }
+
+        const script = document.createElement('script');
+        script.src = 'assets/flashcards/' + termKey + '.js';
+        script.setAttribute('data-fc-term', termKey);
+        script.onload  = function () { script.setAttribute('data-done', '1'); finish(); };
+        script.onerror = function () {
+            // A missing file is normal (term has no flashcards yet); being offline is a failed load.
+            if (!navigator.onLine) { script.remove(); finish(true); return; }
+            script.setAttribute('data-done', '1'); finish();
+        };
+        document.head.appendChild(script);
+    });
+}
+
+// ── MODE AVAILABILITY (data-driven kill switch) ────────────
+// A study-mode button exists only while the current course/term has data for that mode.
+// Add the data file → the mode appears on the next load. No code change, no "soon" labels.
+// _modeLoadFailed marks a FAILED load (offline / manifest file unreachable) so a network
+// problem is never mistaken for "no data": a failed mode stays visible and is retried.
+const _modeLoadFailed = {};   // termKey → { mcq, essay, flashcard, documents }
+const _docsCache = {};        // termKey → documents list from the Gatekeeper ([] = this term has none)
+
+// Terms that have content but no MCQ file (e.g. documents only). Add "COURSE_TERM": true here;
+// everything else is judged by MCQ_MANIFEST. Leave empty until you need it.
+const EXTRA_TERMS = {};
+const _MODE_FNS = ['renderQuiz', 'renderShortAnswers', 'renderEssaySimulation', 'renderFlashcardTopics'];
+
+function _setModeFailed(termKey, kind, val) {
+    (_modeLoadFailed[termKey] = _modeLoadFailed[termKey] || {})[kind] = !!val;
+}
+
+function _modeAvailability() {
+    const f = _modeLoadFailed[currentTermKey] || {};
+    return {
+        renderQuiz:            (currentMcqData || []).length > 0 || !!f.mcq,
+        renderShortAnswers:    (currentShortData || []).length > 0,
+        renderEssaySimulation: (currentEssayData || []).length > 0 || !!f.essay,
+        renderFlashcardTopics: Object.keys(currentFlashcardTopics || {}).length > 0 || !!f.flashcard,
+        renderDocuments:       (_docsCache[currentTermKey] || []).length > 0 || !!f.documents
+    };
+}
+
+function _modeFnOf(btn) {
+    const m = (btn.getAttribute('onclick') || '').match(/^\s*(\w+)\s*\(/);
+    return (m && _MODE_FNS.indexOf(m[1]) !== -1) ? m[1] : null;
+}
+
+// Dark the instant a term is tapped, until its data confirms what exists.
+function hideModeButtons() {
+    document.querySelectorAll('.mode-buttons button[onclick]').forEach(function (btn) {
+        if (_modeFnOf(btn)) btn.style.display = 'none';
+    });
+    const docsBtn = document.getElementById('docs-btn');
+    if (docsBtn) docsBtn.style.display = 'none';
+}
+
+function applyModeAvailability() {
+    const has = _modeAvailability();
+    document.querySelectorAll('.mode-buttons button[onclick]').forEach(function (btn) {
+        const fn = _modeFnOf(btn);
+        if (fn) btn.style.display = has[fn] ? '' : 'none';
+    });
+    const docsBtn = document.getElementById('docs-btn');
+    if (docsBtn) docsBtn.style.display = has.renderDocuments ? '' : 'none';
+}
+
+// "Switch Learning Mode" panels on finish screens: drop modes with no data.
+// Returns true when at least one button is left (caller appends the panel only then).
+function _pruneSwitchPanel(panel) {
+    const has = _modeAvailability();
+    let left = 0;
+    panel.querySelectorAll('button[onclick]').forEach(function (btn) {
+        const fn = _modeFnOf(btn);
+        if (fn && !has[fn]) btn.remove(); else left++;
+    });
+    return left > 0;
+}
+
+// Progress dashboard: keep a row when the mode has data now OR the student has history in it.
+function _dashModeVisible(fn, historical) {
+    return !!_modeAvailability()[fn] || Number(historical) > 0;
+}
+
+// Documents live on the Gatekeeper, so availability needs one network call per term.
+// Resolves to the list, or null when the request itself failed (network / bad response).
+async function _fetchDocsForTerm(termKey, course, term) {
+    if (_docsCache[termKey]) return _docsCache[termKey];
+    try {
+        const response = await fetch(DOCS_SCRIPT_URL, {
+            method: 'POST',
+            redirect: 'follow',
+            headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+            body: JSON.stringify({ action: 'GET_STUDENT_DOCS', course: course, term: term })
+        });
+        if (!response.ok) throw new Error('docs http ' + response.status);
+        const data = await response.json();
+        const list = (data && data.success)
+            ? (data.documents || (data.data && data.data.documents) || [])
+            : [];
+        _docsCache[termKey] = list;
+        _setModeFailed(termKey, 'documents', false);
+        return list;
+    } catch (e) {
+        _setModeFailed(termKey, 'documents', true);   // failed ≠ empty: button stays, retry below
+        return null;
+    }
+}
+
+async function _loadDocsAvailability(termKey, course, term, attempt) {
+    attempt = attempt || 1;
+    const list = await _fetchDocsForTerm(termKey, course, term);
+    if (currentTermKey !== termKey) return;
+    applyModeAvailability();
+    if (list === null && attempt < 3) {
+        setTimeout(function () {
+            if (currentTermKey === termKey) _loadDocsAvailability(termKey, course, term, attempt + 1);
+        }, 6000);
+    }
+}
+
+// A failed load must not read as "empty": show a retrying note instead of the empty-state text.
+function _emptyOrRetrying(kind, emptyHtml) {
+    const f = _modeLoadFailed[currentTermKey] || {};
+    return f[kind]
+        ? '<h3>📡 Still loading</h3><p style="color:#a0a8b4;">Connection issue — retrying automatically…</p>'
+        : emptyHtml;
+}
+
+// A failed load (not an empty one) retries quietly a few times, then the mode reveals itself.
+function _healFailedLoads(termKey, attempt) {
+    attempt = attempt || 1;
+    const f = _modeLoadFailed[termKey];
+    if (!f || !(f.mcq || f.essay || f.flashcard) || attempt > 3) return;
+    setTimeout(async function () {
+        if (currentTermKey !== termKey) return;
+        const course = currentCourse, term = currentTerm;
+        const mcq = f.mcq       ? await loadMcqForTermKey(termKey) : null;
+        const es  = f.essay     ? await loadEssayForTermKey(termKey, course, term) : null;
+        const fc  = f.flashcard ? await loadFlashcardsForTermKey(termKey, course, term) : null;
+        if (currentTermKey !== termKey) return;   // moved to another term mid-retry: drop the results
+        if (mcq) currentMcqData         = mcq;
+        if (es)  currentEssayData       = es;
+        if (fc)  currentFlashcardTopics = fc;
+        applyModeAvailability();
+        _healFailedLoads(termKey, attempt + 1);
+    }, 6000);
 }
 
 // Disable any term button whose dataset file is not yet in the manifest.
@@ -383,13 +726,16 @@ function hideUnavailableTerms() {
         const m = onclick.match(/loadCourse\('(\w+)',\s*'(\w+)'/);
         if (!m) return;
         const key = m[1] + '_' + m[2];
-        if (!MCQ_MANIFEST[key]) {
+        if (!MCQ_MANIFEST[key] && !EXTRA_TERMS[key]) {
             btn.disabled = true;
-            btn.title = 'Content coming soon';
-            btn.style.opacity = '0.4';
-            btn.style.cursor = 'not-allowed';
-            if (btn.textContent.indexOf('(soon)') === -1) btn.textContent += ' (soon)';
+            btn.style.display = 'none';   // no dataset → no button (no "soon" label)
         }
+    });
+    // Course level: no visible term → no course button (same rule, one level up).
+    document.querySelectorAll('.course-section').forEach(function (sec) {
+        const terms = sec.querySelectorAll('.term-buttons button');
+        const anyVisible = Array.prototype.some.call(terms, function (b) { return b.style.display !== 'none'; });
+        if (terms.length > 0 && !anyVisible) sec.style.display = 'none';
     });
 }
 
@@ -447,6 +793,7 @@ async function initializeCourseLogic() {
         if (!document.getElementById('docs-btn')) {
             const docBtn = document.createElement('button');
             docBtn.id = 'docs-btn';
+            docBtn.style.display = 'none';   // revealed by applyModeAvailability() once the term has documents
             docBtn.innerHTML = "📂 Course Documents";
             docBtn.style.backgroundColor = "#28a745"; 
             docBtn.style.color = "white";
@@ -476,8 +823,13 @@ async function initializeCourseLogic() {
     // Filter Data — MCQ loads per-term from the manifest; the others use legacy globals.
     currentMcqData         = await loadMcqForTermKey(currentTermKey);
     currentShortData       = filterDataByCourseAndTerm(allShortData, currentCourse, currentTerm);
-    currentEssayData       = filterDataByCourseAndTerm(allEssayData, currentCourse, currentTerm);
-    currentFlashcardTopics = filterFlashcardsByCourseAndTerm(allFlashcards, currentCourse, currentTerm);
+    currentEssayData       = await loadEssayForTermKey(currentTermKey, currentCourse, currentTerm);
+    currentFlashcardTopics = await loadFlashcardsForTermKey(currentTermKey, currentCourse, currentTerm);
+
+    // Mode kill switch: a study mode shows only when this course/term has data for it.
+    applyModeAvailability();
+    _healFailedLoads(currentTermKey);
+    _loadDocsAvailability(currentTermKey, currentCourse, currentTerm);   // background; Documents appears when the list is non-empty
 
     // Inject Viewer HTML if missing
     if (!document.getElementById('smart-doc-viewer')) {
@@ -762,6 +1114,7 @@ async function renderDocuments() {
         const data = await response.json();
         const documents = data.documents || (data.data && data.data.documents) || [];
         const success = data.success || false;
+        if (success) { _docsCache[currentTermKey] = documents; applyModeAvailability(); }
         
         if (!success || documents.length === 0) {
             container.innerHTML = `<div style="text-align:center; padding:30px;"><h3>📂 Library Empty</h3><p>No active documents found.</p><button class="restart-button" onclick="exitQuiz()">Back to Menu</button></div>`;
@@ -1061,7 +1414,7 @@ function blockDemo(type) {
     
     const key = `demo_${type}_used_${currentTermKey}`;
     let attempts = parseInt(localStorage.getItem(key) || "0");
-    const maxAttempts = KAERI_CONFIG.demoAttemptLimit;
+    const maxAttempts = getDemoLimit();
     const attemptsLeft = maxAttempts - attempts;
     
     if (attempts < maxAttempts) {
@@ -1085,7 +1438,7 @@ function canUseDemo(type) {
     if (hasFullAccess) return true;
     const key = `demo_${type}_used_${currentTermKey}`;
     const attempts = parseInt(localStorage.getItem(key) || "0");
-    return attempts < KAERI_CONFIG.demoAttemptLimit;
+    return attempts < getDemoLimit();
 }
 
 // ── Charge: consume one attempt and notify the user. ──
@@ -1096,7 +1449,7 @@ function consumeDemoAttempt(type) {
 
     const key = `demo_${type}_used_${currentTermKey}`;
     const attempts = parseInt(localStorage.getItem(key) || "0");
-    const maxAttempts = KAERI_CONFIG.demoAttemptLimit;
+    const maxAttempts = getDemoLimit();
     const attemptsLeft = maxAttempts - attempts;
 
     if (attemptsLeft > 0) {
@@ -1314,28 +1667,28 @@ function renderProgressDashboard() {
 
         <div style="background:#1e2a3a;border-radius:10px;padding:16px;border:1px solid #2b3a55;margin-bottom:18px;">
             <div style="font-size:0.78em;color:#a0a8b4;text-transform:uppercase;letter-spacing:0.8px;margin-bottom:14px;">Performance by Mode</div>
-            <div style="margin-bottom:10px;">
+            <div style="margin-bottom:10px;${_dashModeVisible('renderQuiz', data.mcqBest) ? '' : 'display:none;'}">
                 <div style="display:flex;justify-content:space-between;margin-bottom:4px;">
                     <span style="font-size:0.85em;color:white;">\uD83D\uDCDD MCQ</span>
                     <span style="font-size:0.75em;color:#a0a8b4;">Best: ${data.mcqBest}%</span>
                 </div>
                 ${bar(mcqAvg, '#72efdd')}
             </div>
-            <div style="margin-bottom:10px;">
+            <div style="margin-bottom:10px;${_dashModeVisible('renderShortAnswers', data.saBest) ? '' : 'display:none;'}">
                 <div style="display:flex;justify-content:space-between;margin-bottom:4px;">
                     <span style="font-size:0.85em;color:white;">\u270D\uFE0F Short Answer</span>
                     <span style="font-size:0.75em;color:#a0a8b4;">Best: ${data.saBest}%</span>
                 </div>
                 ${bar(saAvg, '#ffc107')}
             </div>
-            <div style="margin-bottom:2px;">
+            <div style="margin-bottom:2px;${_dashModeVisible('renderEssaySimulation', data.essayBest) ? '' : 'display:none;'}">
                 <div style="display:flex;justify-content:space-between;margin-bottom:4px;">
                     <span style="font-size:0.85em;color:white;">\uD83D\uDCC4 Essay Sim</span>
                     <span style="font-size:0.75em;color:#a0a8b4;">Best: ${data.essayBest}%</span>
                 </div>
                 ${bar(esAvg, '#e67e00')}
             </div>
-            <div style="margin-top:12px;padding-top:10px;border-top:1px solid #2b3a55;">
+            <div style="margin-top:12px;padding-top:10px;border-top:1px solid #2b3a55;${_dashModeVisible('renderFlashcardTopics', data.flashcardSessions) ? '' : 'display:none;'}">
                 <span style="font-size:0.85em;color:white;">\uD83C\uDCCF Flashcard Sessions</span>
                 <span style="float:right;font-size:0.85em;color:#a78bfa;font-weight:700;">${data.flashcardSessions}</span>
             </div>
@@ -1498,6 +1851,9 @@ function enableDemoUI() {
 }
 
 function loadCourse(course, term) {
+    // Mode kill switch: the previous term's modes/data must never be usable under the new term's title.
+    hideModeButtons();
+    currentMcqData = []; currentShortData = []; currentEssayData = []; currentFlashcardTopics = {};
     document.body.setAttribute('data-course', course);
     document.body.setAttribute('data-term', term);
 
@@ -2712,7 +3068,7 @@ function _escInline(s) {
 function _demoAttemptsLeft() {
     const key = 'demo_mcq_used_' + currentTermKey;
     const used = parseInt(localStorage.getItem(key) || '0');
-    return Math.max(0, KAERI_CONFIG.demoAttemptLimit - used);
+    return Math.max(0, getDemoLimit() - used);
 }
 
 // ────────────────────────────────────────────────────────────
@@ -2741,8 +3097,8 @@ function renderDemoMcqPicker() {
     if (!currentMcqData || currentMcqData.length === 0) {
         const container = document.getElementById('quiz-form');
         container.innerHTML = '<div style="text-align:center;padding:40px 20px;">'
-            + '<h3>📭 No questions yet</h3>'
-            + '<p style="color:#a0a8b4;">No MCQ content for ' + currentCourse + ' ' + currentTerm + '.</p>'
+            + _emptyOrRetrying('mcq', '<h3>📭 No questions yet</h3>'
+            + '<p style="color:#a0a8b4;">No MCQ content for ' + currentCourse + ' ' + currentTerm + '.</p>')
             + '</div>';
         return;
     }
@@ -3074,8 +3430,8 @@ function renderMcqMenu() {
 
     if (!currentMcqData || currentMcqData.length === 0) {
         container.innerHTML = '<div style="text-align:center;padding:40px 20px;">'
-            + '<h3>📭 No questions yet</h3>'
-            + '<p style="color:#a0a8b4;">No MCQ content for ' + currentCourse + ' ' + currentTerm + '.</p>'
+            + _emptyOrRetrying('mcq', '<h3>📭 No questions yet</h3>'
+            + '<p style="color:#a0a8b4;">No MCQ content for ' + currentCourse + ' ' + currentTerm + '.</p>')
             + '</div>';
         return;
     }
@@ -3541,6 +3897,10 @@ function startSelectedMcq() {
 // ── Short Answer entry (demo contract unchanged) ────────────
 // ────────────────────────────────────────────────────────────
 function renderShortAnswers() {
+    if (!currentShortData || currentShortData.length === 0) {
+        showAppNotification('No short answer questions for this term.', 'info', 2000);
+        return;
+    }
     if (!hasFullAccess) {
         if (blockDemo('shortAnswer')) return;
         startActualShortAnswer(10);
@@ -3733,7 +4093,7 @@ function showFinalMcqScore() {
             <button onclick="renderFlashcardTopics()" style="background:#2b3a55; color:white; border:1px solid #3e506e; padding:8px 14px; border-radius:8px; cursor:pointer; font-size:0.85em;">🃏 Flashcards</button>
         </div>
     `;
-    container.appendChild(switchDiv);
+    if (_pruneSwitchPanel(switchDiv)) container.appendChild(switchDiv);
 
     recordProgressSession('mcq', currentScore, currentQuizData.length, `${currentCourse} ${currentTerm} MCQ`);
     logAnalyticsEvent('quiz_complete', `MCQ score: ${currentScore}/${currentQuizData.length} (${percent}%)`);
@@ -3844,7 +4204,7 @@ function showFinalShortAnswerScore() {
             <button onclick="renderFlashcardTopics()" style="background:#2b3a55; color:white; border:1px solid #3e506e; padding:8px 14px; border-radius:8px; cursor:pointer; font-size:0.85em;">🃏 Flashcards</button>
         </div>
     `;
-    container.appendChild(switchDiv);
+    if (_pruneSwitchPanel(switchDiv)) container.appendChild(switchDiv);
 
     recordProgressSession('shortAnswer', currentScore, currentQuizData.length, `${currentCourse} ${currentTerm} Short Answer`);
     logAnalyticsEvent('quiz_complete', `Short Answer score: ${currentScore}/${currentQuizData.length} (${percent}%)`);
@@ -3855,14 +4215,17 @@ function renderEssaySimulation() {
     container.innerHTML = "";
     document.getElementById("result").innerHTML = "";
 
-    currentQuizData = currentEssayData; 
-    if (currentQuizData.length === 0) {
-        container.innerHTML = "<p>No essay simulations available for this term yet.</p>";
+    if (currentEssayData.length === 0) {
+        container.innerHTML = _emptyOrRetrying('essay', "<p>No essay simulations available for this term yet.</p>");
         updateProgress(0, 0);
         return;
     }
 
-    currentQuizType = 'essay'; 
+    // Setup screen: not a running quiz (keeps beforeunload / key handlers quiet)
+    currentQuizType = 'essayMenu';
+    currentQuizData = [];
+    currentQuestionIndex = 0;
+    currentEssay = null;
     updateProgress(0, 0);
 
     const header = document.createElement("h2");
@@ -3874,7 +4237,7 @@ function renderEssaySimulation() {
     const listDiv = document.createElement('div');
     listDiv.className = 'flashcard-topic-buttons'; 
 
-    currentQuizData.forEach((essay, index) => {
+    currentEssayData.forEach((essay, index) => {
         const btn = document.createElement("button");
         btn.textContent = essay.title; 
         btn.onclick = () => attemptStartEssay(index); 
@@ -3885,12 +4248,30 @@ function renderEssaySimulation() {
 }
 
 function attemptStartEssay(index) {
-    if (blockDemo('essay')) return; 
+    confirmStartEssay(index);
+}
+
+// Single, atomic charge → then run (picker tap and retry share this path).
+function confirmStartEssay(index) {
+    if (blockDemo('essay')) return;
     startSpecificEssay(index);
 }
 
+// Essay steps are MCQ items in a sequence: options shuffle per attempt via the MCQ shuffler
+// (orderMatters honoured). Step order itself is never shuffled.
+function shuffleEssayOptions(essay) {
+    if (!essay || !Array.isArray(essay.steps)) return essay;
+    return Object.assign({}, essay, {
+        steps: essay.steps.map(function (step) {
+            return shuffleQuestionOptions(step);
+        })
+    });
+}
+
 function startSpecificEssay(index) {
-    currentEssay = currentQuizData[index];
+    currentQuizType = 'essay';
+    currentEssay = shuffleEssayOptions(currentEssayData[index]);
+    currentEssayIndex = index;
     currentStepIndex = 0;
     essayScore = 0;
     document.getElementById("result").innerHTML = "";
@@ -3907,7 +4288,7 @@ function showEssayStep(index) {
     if (!step) return showFinalEssayScore();
     
     let html = `
-        <div class="question-header"><h3>📄 ${essay.title} — Step ${index + 1} of ${essay.steps.length}</h3><p>Topic: ${essay.topic} | ${essay.year}</p></div>
+        <div class="question-header"><h3>📄 ${essay.title} — Step ${index + 1} of ${essay.steps.length}</h3>${essay.topic ? `<p>Topic: ${essay.topic}</p>` : ''}</div>
         <div class="question-box"><p><strong>Q:</strong> ${parseKaeriMarkdown(step.q)}</p><div class="options">
     `;
     step.options.forEach((opt, i) => {
@@ -3991,7 +4372,7 @@ function showFinalEssayScore() {
     retryBtn.innerText = "🔁 Retry This Essay";
     retryBtn.className = "restart-button";
     retryBtn.style.marginRight = "10px";
-    retryBtn.onclick = () => attemptStartEssay(currentQuizData.indexOf(currentEssay));
+    retryBtn.onclick = () => confirmStartEssay(currentEssayIndex);
     container.appendChild(retryBtn);
 
     const challengeBtn = document.createElement("button");
@@ -4024,7 +4405,7 @@ function showFinalEssayScore() {
             <button onclick="renderFlashcardTopics()" style="background:#2b3a55; color:white; border:1px solid #3e506e; padding:8px 14px; border-radius:8px; cursor:pointer; font-size:0.85em;">🃏 Flashcards</button>
         </div>
     `;
-    container.appendChild(switchDiv);
+    if (_pruneSwitchPanel(switchDiv)) container.appendChild(switchDiv);
 
     recordProgressSession('essay', essayScore, currentEssay.steps.length, currentEssay.title);
     logAnalyticsEvent('essay_complete', `${currentEssay.title} score: ${essayScore}/${currentEssay.steps.length} (${percent}%)`);
@@ -4319,7 +4700,48 @@ function _cleanupRetiredMcqSrs() {
 // === 8. FLASHCARD ENGINE - HYBRID MASTER (LINEAR + SRS) ===
 // ============================================================
 
+// JS-string escape first, then HTML-attribute escape (value sits inside onclick="...").
+function _escOnclickArg(topic) {
+    return _escAttr(topic).replace(/&/g, '&amp;').replace(/"/g, '&quot;')
+                          .replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
 // --- TOPIC SELECTION & MODE CHOICE ---
+// Two-level picker: Parent → Subtopic, mirroring the MCQ wizard's mainTopic → topic.
+// Data stays flat ("Parent: Child"); grouping is display-only. The full string is the SRS key
+// and is always passed unchanged to attemptStartFlashcard / getCardSRS.
+function _groupFlashcardTopics(flat) {
+    const groups = {};
+    for (const full in flat) {
+        if (!Object.prototype.hasOwnProperty.call(flat, full)) continue;
+        const sep = full.indexOf(':');
+        const parent = sep > -1 ? full.slice(0, sep).trim() : 'Other';
+        const child  = sep > -1 ? full.slice(sep + 1).trim() : full;
+        (groups[parent] = groups[parent] || []).push({
+            full: full,            // SRS key — never touched
+            child: child,          // display label
+            cards: flat[full]
+        });
+    }
+    return groups;
+}
+
+// Which parent group does a topic belong to? ("Microscopy: Darkfield" → "Microscopy")
+function _topicParent(topic) {
+    const sep = String(topic || '').indexOf(':');
+    return sep > -1 ? String(topic).slice(0, sep).trim() : 'Other';
+}
+
+function _topicDueCount(topic, cards) {
+    const now = Date.now();
+    let due = 0;
+    (cards || currentFlashcardTopics[topic] || []).forEach(function (_, i) {
+        const srs = getCardSRS(topic, i);
+        if (srs.isNew || srs.dueDate <= now) due++;
+    });
+    return due;
+}
+
 function renderFlashcardTopics() {
     const container = document.getElementById("quiz-form");
     container.innerHTML = "";
@@ -4328,25 +4750,85 @@ function renderFlashcardTopics() {
     updateProgress(0, 0);
 
     if (Object.keys(currentFlashcardTopics).length === 0) {
-        container.innerHTML = "<p>No flashcards available for this term.</p>";
+        container.innerHTML = _emptyOrRetrying('flashcard', "<p>No flashcards available for this term.</p>");
+        return;
+    }
+
+    const groups = _groupFlashcardTopics(currentFlashcardTopics);
+    const parentNames = Object.keys(groups);   // authored order
+
+    // Only one parent → skip the parent screen
+    if (parentNames.length === 1) {
+        renderFlashcardSubtopics(parentNames[0]);
         return;
     }
 
     const header = document.createElement("h2");
-    header.innerText = "Select Flashcard Topic";
+    header.innerText = "Choose a Topic";
     header.style.textAlign = "center";
     header.style.marginBottom = "25px";
     container.appendChild(header);
 
     const listDiv = document.createElement('div');
     listDiv.className = 'flashcard-topic-buttons';
-    
-    for (const topic in currentFlashcardTopics) {
+
+    parentNames.forEach(function (parent) {
+        const subs = groups[parent];
+        const due = subs.reduce(function (n, x) { return n + _topicDueCount(x.full, x.cards); }, 0);
+        const cardCount = subs.reduce(function (n, x) { return n + x.cards.length; }, 0);
+
         const btn = document.createElement("button");
-        btn.textContent = topic;
-        btn.onclick = () => attemptStartFlashcard(topic);
+        btn.innerHTML =
+            '<div style="font-size:1.1em; font-weight:700;">' + escapeHtml(parent) + '</div>' +
+            '<div style="font-size:0.8em; opacity:0.8; margin-top:4px;">' +
+            subs.length + ' deck' + (subs.length === 1 ? '' : 's') + ' · ' +
+            cardCount + ' cards · ' + due + ' due</div>';
+        btn.onclick = function () { renderFlashcardSubtopics(parent); };
         listDiv.appendChild(btn);
+    });
+    container.appendChild(listDiv);
+}
+
+function renderFlashcardSubtopics(parent) {
+    const container = document.getElementById("quiz-form");
+    container.innerHTML = "";
+    document.getElementById("result").innerHTML = "";
+    currentQuizType = 'flashcard';
+    updateProgress(0, 0);
+
+    const groups = _groupFlashcardTopics(currentFlashcardTopics);
+    const subs = groups[parent] || [];
+    if (!subs.length) { renderFlashcardTopics(); return; }
+    const multiParent = Object.keys(groups).length > 1;
+
+    if (multiParent) {
+        const back = document.createElement("button");
+        back.className = "back-button";
+        back.textContent = "⬅ All topics";
+        back.style.marginBottom = "15px";
+        back.onclick = function () { renderFlashcardTopics(); };
+        container.appendChild(back);
     }
+
+    const header = document.createElement("h2");
+    header.innerText = (parent === 'Other') ? "Select Flashcard Topic" : parent;
+    header.style.textAlign = "center";
+    header.style.marginBottom = "25px";
+    container.appendChild(header);
+
+    const listDiv = document.createElement('div');
+    listDiv.className = 'flashcard-topic-buttons';
+
+    subs.forEach(function (sub) {
+        const due = _topicDueCount(sub.full, sub.cards);
+        const btn = document.createElement("button");
+        btn.innerHTML =
+            '<div style="font-weight:700;">' + escapeHtml(sub.child) + '</div>' +
+            '<div style="font-size:0.8em; opacity:0.8; margin-top:4px;">' +
+            sub.cards.length + ' cards · ' + due + ' due</div>';
+        btn.onclick = function () { attemptStartFlashcard(sub.full); };   // SRS key preserved
+        listDiv.appendChild(btn);
+    });
     container.appendChild(listDiv);
 }
 
@@ -4357,6 +4839,7 @@ function attemptStartFlashcard(topic) {
 
 function showFlashcardModeSelection(topic) {
     const container = document.getElementById("quiz-form");
+    const safeCancelTopic = _escOnclickArg(topic);   // Cancel returns to this topic's subtopic list
     const totalCards = currentFlashcardTopics[topic].length;
     
     // Calculate SRS Due Count
@@ -4370,13 +4853,13 @@ function showFlashcardModeSelection(topic) {
     // Render Choice Menu
     container.innerHTML = `
         <div style="text-align: center; animation: fadeIn 0.3s;">
-            <h2 style="margin-bottom: 10px; color: white;">🗂️ ${topic}</h2>
+            <h2 style="margin-bottom: 10px; color: white;">🗂️ ${escapeHtml(topic)}</h2>
             <p style="color: #a0a8b4; margin-bottom: 25px;">Choose your study method:</p>
 
             <div style="display: flex; flex-direction: column; gap: 15px; max-width: 450px; margin: 0 auto;">
                 
                 <!-- OPTION 1: LINEAR (Review All) -->
-                <button onclick="startFlashcards('${topic}', 'linear')" 
+                <button onclick="startFlashcards('${_escOnclickArg(topic)}', 'linear')" 
                     style="background: #1e2a3a; border: 2px solid #72efdd; padding: 20px; border-radius: 12px; text-align: left; cursor: pointer; transition: 0.2s; box-shadow: 0 4px 6px rgba(0,0,0,0.3);">
                     <div style="display: flex; align-items: center; gap: 15px;">
                         <span style="font-size: 2em;">📖</span>
@@ -4388,7 +4871,7 @@ function showFlashcardModeSelection(topic) {
                 </button>
 
                 <!-- OPTION 2: SRS (Smart) -->
-                <button onclick="startFlashcards('${topic}', 'srs')" 
+                <button onclick="startFlashcards('${_escOnclickArg(topic)}', 'srs')" 
                     style="background: #1e2a3a; border: 2px solid #ffc107; padding: 20px; border-radius: 12px; text-align: left; cursor: pointer; transition: 0.2s; box-shadow: 0 4px 6px rgba(0,0,0,0.3);">
                     <div style="display: flex; align-items: center; gap: 15px;">
                         <span style="font-size: 2em;">🧠</span>
@@ -4404,7 +4887,7 @@ function showFlashcardModeSelection(topic) {
 
             </div>
             
-            <button class="back-button" style="margin-top: 30px; background: transparent; color: #888; border: 1px solid #3e506e; padding: 10px 20px; border-radius: 20px;" onclick="renderFlashcardTopics()">Cancel</button>
+            <button class="back-button" style="margin-top: 30px; background: transparent; color: #888; border: 1px solid #3e506e; padding: 10px 20px; border-radius: 20px;" onclick="renderFlashcardSubtopics(_topicParent('${safeCancelTopic}'))">Cancel</button>
         </div>
     `;
 }
@@ -4442,7 +4925,7 @@ function startFlashcards(topic, mode) {
                 <h2 style="color: #28a745;">You're Caught Up!</h2>
                 <p style="color: #a0a8b4; max-width: 400px; margin: 10px auto;">You have no cards due for review right now in SRS mode.</p>
                 <div style="margin-top: 20px; display: flex; flex-direction: column; gap: 10px; align-items: center;">
-                    <button class="restart-button" onclick="startFlashcards('${topic}', 'linear')">📖 Switch to Standard Review</button>
+                    <button class="restart-button" onclick="startFlashcards('${_escOnclickArg(topic)}', 'linear')">📖 Switch to Standard Review</button>
                     <button class="back-button" onclick="renderFlashcardTopics()">⬅ Back to Topics</button>
                 </div>
             </div>`;
@@ -4485,7 +4968,8 @@ function displayFlashcard() {
         const hasScience = /(\\ce\{|\\pu\{|\\vec\{|\\int|\\sum|\\frac\{|\\sqrt\{)/.test(text);
     
         // 3. Detect Lists (Bullet points)
-        const hasList = /^- /m.test(text) || /<ul>|<ol>|<li>/.test(parseKaeriMarkdown(text));
+        const hasList = /^- /m.test(text) || /<ul>|<ol>|<li>/.test(parseKaeriMarkdown(text))
+                     || /^\s*\|.*\|\s*$/m.test(text);   // pipe table
     
         // 4. Detect Text Length (lowered to 60 for mobile safety)
         const isLong = text.length > 60;
@@ -4509,7 +4993,7 @@ function displayFlashcard() {
     // RENDER CARD HTML
     let html = `
         <h3 style="color: #a0a8b4; font-size: 0.9em; letter-spacing: 1px; text-transform: uppercase;">
-            ${modeLabel}: ${currentFlashcardTopic} <span style="color: white;">(${currentCardIndex + 1} / ${currentFlashcards.length})</span>
+            ${modeLabel}: ${escapeHtml(currentFlashcardTopic)} <span style="color: white;">(${currentCardIndex + 1} / ${currentFlashcards.length})</span>
         </h3>
         
         <div class="flashcard-wrapper">
@@ -4669,7 +5153,7 @@ function showFlashcardCompletion() {
             <button onclick="renderEssaySimulation()" style="background:#2b3a55; color:white; border:1px solid #3e506e; padding:8px 14px; border-radius:8px; cursor:pointer; font-size:0.85em;">📄 Essay Sim</button>
         </div>
     `;
-    container.appendChild(switchDiv);
+    if (_pruneSwitchPanel(switchDiv)) container.appendChild(switchDiv);
 
     recordProgressSession('flashcard', currentFlashcards.length, currentFlashcards.length, `${currentFlashcardTopic} Flashcards`);
     logAnalyticsEvent('flashcard_complete', `${currentFlashcardTopic} (${currentFlashcardMode} mode)`);
@@ -4756,14 +5240,27 @@ function _buildSectionsFromSession() {
             items: currentEssay.steps,
         });
     } else if (type === 'flashcard') {
+        // Flashcards are Main topic → Subtopic ("Parent: Child"). The kit prints the whole subtopic
+        // deck in authored order (not just the SRS-due queue) and labels both levels.
+        const full   = currentFlashcardTopic || '';
+        const sep    = full.indexOf(':');
+        const parent = sep > -1 ? full.slice(0, sep).trim() : '';
+        const child  = sep > -1 ? full.slice(sep + 1).trim() : full;
+        const deck   = (currentFlashcardTopics && currentFlashcardTopics[full]) || currentFlashcards || [];
         sections.push({
-            num:   1,
-            name:  currentFlashcardTopic,
-            pal:   SECTION_PALETTE[3],
-            items: currentFlashcards,
+            num:    1,
+            parent: parent,                       // Main topic ('' when the topic has no "Parent:" prefix)
+            name:   child,                        // Subtopic
+            pal:    SECTION_PALETTE[3],
+            items:  deck.map(function (c) { return { front: c.front, back: c.back }; }),   // drop SRS fields
         });
     }
     return sections;
+}
+
+// "Main topic › Subtopic" label used on kit cards (plain subtopic when there is no main topic)
+function _kitSectionLabel(sec) {
+    return sec.parent ? sec.parent + ' › ' + sec.name : sec.name;
 }
 
 function _itemCardHTML(item, sectionName, type, idx, pal) {
@@ -4806,9 +5303,28 @@ function _itemCardHTML(item, sectionName, type, idx, pal) {
     } else if (type === 'essay') {
         labelText = 'Step ' + (idx + 1);
         qHTML = md(item.q);
-        const opt = (item.options && item.options[item.correct] !== undefined)
-            ? String.fromCharCode(65 + item.correct) + '. ' + md(item.options[item.correct]) : '—';
-        aHTML = '<strong>Correct:</strong> ' + opt;
+
+        // Same layout as MCQ: all options, correct one highlighted
+        let optionsHTML = '<div style="margin:8px 0 10px 0;">';
+        (item.options || []).forEach(function (opt, i) {
+            const letter    = String.fromCharCode(65 + i);
+            const isCorrect = (i === item.correct);
+            if (isCorrect) {
+                optionsHTML += '<div style="padding:5px 10px;margin:3px 0;'
+                    + 'background:#e8f5e9;border-left:4px solid #28a745;'
+                    + 'border-radius:0 4px 4px 0;font-weight:700;color:#1e3a2f;">'
+                    + letter + '. ' + md(opt) + ' <span style="color:#28a745;">✓</span>'
+                    + '</div>';
+            } else {
+                optionsHTML += '<div style="padding:5px 10px;margin:3px 0;color:#444;">'
+                    + letter + '. ' + md(opt)
+                    + '</div>';
+            }
+        });
+        optionsHTML += '</div>';
+
+        qHTML += optionsHTML;
+        aHTML = '<strong>Answer:</strong> ' + String.fromCharCode(65 + item.correct);
         eHTML = md(item.explanation || 'No additional explanation.');
     } else if (type === 'flashcard') {
         labelText = 'Card ' + (idx + 1);
@@ -4860,10 +5376,10 @@ function generatePrintPreview() {
         <div style="background:${s.pal.bg};color:${s.pal.acc};padding:7px 12px;
                     border-left:5px solid ${s.pal.acc};font-weight:700;font-size:11px;
                     margin-bottom:8px;border-radius:3px;">
-            SECTION ${s.num} · ${s.name.toUpperCase()}
+            ${s.parent ? `<div style="font-size:9px;font-weight:700;letter-spacing:0.5px;opacity:0.85;margin-bottom:2px;">MAIN TOPIC · ${s.parent.toUpperCase()}</div>` : ''}SECTION ${s.num} · ${s.name.toUpperCase()}
         </div>`;
         s.items.forEach((item, idx) => {
-            previewHTML += `<div style="margin-bottom:8px;">${_itemCardHTML(item, s.name, currentQuizType, idx, s.pal)}</div>`;
+            previewHTML += `<div style="margin-bottom:8px;">${_itemCardHTML(item, _kitSectionLabel(s), currentQuizType, idx, s.pal)}</div>`;
         });
     });
 
@@ -4961,7 +5477,7 @@ const qrUrl = 'https://quickchart.io/qr?text=' + encodeURIComponent(platformUrl)
                     font-size:12px;font-weight:500;background:${s.pal.bg};margin-bottom:6px;
                     page-break-inside:avoid;break-inside:avoid;">
             <span style="font-weight:800;color:${s.pal.acc};margin-right:18px;min-width:22px;">${String(s.num).padStart(2, '0')}</span>
-            <span style="flex-grow:1;color:#222;">${s.name}</span>
+            <span style="flex-grow:1;color:#222;">${s.parent ? `<span style="display:block;font-size:9px;font-weight:700;letter-spacing:0.5px;text-transform:uppercase;color:${s.pal.acc};margin-bottom:2px;">${s.parent}</span>` : ''}${s.name}</span>
             <span style="color:#666;margin-right:14px;font-size:10px;">${typePrefix}1 – ${typePrefix}${s.items.length}</span>
             <span style="font-weight:700;color:${s.pal.acc};">${s.items.length} items</span>
         </div>`;
@@ -4969,6 +5485,16 @@ const qrUrl = 'https://quickchart.io/qr?text=' + encodeURIComponent(platformUrl)
 
     const sectionsJSON = JSON.stringify(sections);
     const currentYear = new Date().getFullYear();
+
+    // Cover: Main topic / Subtopic (flashcard kits)
+    const kitParents = sections.map(s => s.parent).filter((p, i, a) => p && a.indexOf(p) === i);
+    const coverTopicHTML = kitParents.length ? `
+        <div style="margin-top:22px;max-width:78%;border-left:4px solid var(--yellow);padding-left:14px;">
+            <div style="font-size:10px;font-weight:800;color:var(--yellow);letter-spacing:1.5px;">MAIN TOPIC</div>
+            <div style="font-size:17px;font-weight:700;color:white;margin:2px 0 10px 0;line-height:1.3;">${kitParents.join(' · ')}</div>
+            <div style="font-size:10px;font-weight:800;color:var(--yellow);letter-spacing:1.5px;">SUBTOPIC${sections.length !== 1 ? 'S' : ''}</div>
+            <div style="font-size:14px;font-weight:500;color:#ddd;margin-top:2px;line-height:1.4;">${sections.map(s => s.name).join(' · ')}</div>
+        </div>` : '';
 
     return `<!DOCTYPE html>
 <html lang="en">
@@ -5027,6 +5553,13 @@ const qrUrl = 'https://quickchart.io/qr?text=' + encodeURIComponent(platformUrl)
     .ans { font-size:12px; font-weight:500; background:#f0faf4; padding:7px 11px; border-radius:6px; margin-bottom:7px; border-left:4px solid var(--acc); }
     .expl { background:#f4f4fa; padding:6px 10px; font-size:11px; border-left:3px solid var(--acc); border-radius:0 5px 5px 0; }
     .topic-banner { background:var(--bg); color:var(--acc); padding:8px 13px; border-left:6px solid var(--acc); font-weight:700; margin-bottom:12px; }
+    .kaeri-table-wrap { margin:8px 0 10px; border:1px solid #c0c0e0; border-radius:6px; overflow:hidden; }
+    .kaeri-table { border-collapse:collapse; width:100%; font-size:inherit; line-height:1.4; }
+    .kaeri-table th { background:var(--bg,#e8eaf6); color:var(--acc,#1a237e); font-weight:800; font-size:0.92em; padding:5px 8px; border-bottom:2px solid var(--acc,#1a237e); vertical-align:bottom; }
+    .kaeri-table td { padding:5px 8px; border-bottom:1px solid #e1e1f0; vertical-align:top; font-weight:500; color:#333; }
+    .kaeri-table tbody tr:nth-child(even) td { background:#f7f7fc; }
+    .kaeri-table tbody tr:last-child td { border-bottom:none; }
+    .kaeri-table tr { break-inside:avoid; page-break-inside:avoid; }
     .katex-display { overflow-x: auto; overflow-y: hidden; padding-bottom: 5px; }
 </style>
 </head>
@@ -5051,6 +5584,7 @@ const qrUrl = 'https://quickchart.io/qr?text=' + encodeURIComponent(platformUrl)
         <p style="font-size:16px;font-weight:300;color:#ddd;line-height:1.5;margin:0;">
             Complete Study Kit &mdash; ${totalItems} Items
         </p>
+        ${coverTopicHTML}
         <div class="stats-grid">
             <div><span class="stat-num">${totalItems}</span><span class="stat-lbl">ITEMS</span></div>
             <div><span class="stat-num">${sections.length}</span><span class="stat-lbl">SECTIONS</span></div>
@@ -5120,20 +5654,8 @@ const qrUrl = 'https://quickchart.io/qr?text=' + encodeURIComponent(platformUrl)
     const termLabel = '${termLabel}';
     const sessTitle = '${sessInfo.title}';
 
-    // Full Markdown parser (same as main engine)
-    function parseKaeriMarkdown(text) {
-        if (!text) return "";
-        let t = text;
-        t = t.replace(/^## (.*$)/gim, "<h3 style='margin:10px 0; color:#72efdd;'>$1</h3>");
-        t = t.replace(/^# (.*$)/gim, "<h2 style='margin:15px 0; color:#fff;'>$1</h2>");
-        t = t.replace(/^> (.*$)/gim, "<blockquote style='border-left:4px solid #72efdd; margin:10px 0; padding-left:15px; color:#a0a8b4; font-style:italic;'>$1</blockquote>");
-        t = t.replace(/^- (.*$)/gim, "<li style='margin-left:20px;'>$1</li>");
-        t = t.replace(/\\*\\*(.*?)\\*\\*/g, "<strong>$1</strong>");
-        t = t.replace(/__(.*?)__/g, "<u>$1</u>");
-        t = t.replace(/(?<!\\\\)\\*([^\\s].*?)(?<!\\\\)\\*/g, "<em>$1</em>");
-        t = t.replace(/\\n/g, "<br>");
-        return t;
-    }
+    // Markdown parser — the exact functions from the main engine (tables included), embedded verbatim
+    ${[kaeriConvertTables, _kaeriInline, parseKaeriMarkdown].map(function (f) { return f.toString(); }).join(String.fromCharCode(10))}
 
     // Pagination setup
     const MM = 3.7795275591;
@@ -5216,8 +5738,23 @@ const qrUrl = 'https://quickchart.io/qr?text=' + encodeURIComponent(platformUrl)
             explHtml = parseKaeriMarkdown(item.explanation || 'No additional explanation.');
         } else if (sessionType === 'essay') {
             qText = parseKaeriMarkdown(item.q || '');
-            const correctOpt = (item.options && item.options[item.correct]) ? item.options[item.correct] : '—';
-            ansHtml = '<strong>Correct:</strong> ' + parseKaeriMarkdown(correctOpt);
+            var eOpts = item.options || [];
+            var eOptsHtml = '<div style="margin:8px 0 10px 0;">';
+            for (var j = 0; j < eOpts.length; j++) {
+                var eLetter = String.fromCharCode(65 + j);
+                var eIsCorrect = (j === item.correct);
+                if (eIsCorrect) {
+                    eOptsHtml += '<div style="padding:5px 10px;margin:3px 0;background:#e8f5e9;border-left:4px solid #28a745;border-radius:0 4px 4px 0;font-weight:700;color:#1e3a2f;">'
+                        + eLetter + '. ' + parseKaeriMarkdown(eOpts[j])
+                        + ' <span style="color:#28a745;">✓</span></div>';
+                } else {
+                    eOptsHtml += '<div style="padding:5px 10px;margin:3px 0;color:#444;">'
+                        + eLetter + '. ' + parseKaeriMarkdown(eOpts[j]) + '</div>';
+                }
+            }
+            eOptsHtml += '</div>';
+            qText += eOptsHtml;
+            ansHtml = '<strong>Answer:</strong> ' + String.fromCharCode(65 + item.correct);
             explHtml = parseKaeriMarkdown(item.explanation || 'No additional explanation.');
         } else { // flashcard
             qText = parseKaeriMarkdown(item.front || '');
@@ -5242,10 +5779,11 @@ const qrUrl = 'https://quickchart.io/qr?text=' + encodeURIComponent(platformUrl)
             banner.style.backgroundColor = sec.pal.bg;
             banner.style.color = sec.pal.acc;
             banner.style.borderLeftColor = sec.pal.acc;
-            banner.innerHTML = '<div class="banner-text">SECTION ' + sec.num + ': ' + sec.name.toUpperCase() + '</div>';
+            banner.innerHTML = (sec.parent ? '<div style="font-size:9px;font-weight:700;letter-spacing:0.5px;opacity:0.85;margin-bottom:2px;">MAIN TOPIC · ' + sec.parent.toUpperCase() + '</div>' : '')
+                             + '<div class="banner-text">SECTION ' + sec.num + ': ' + sec.name.toUpperCase() + '</div>';
             state = place(banner, state, 0);
             sec.items.forEach((item, idx) => {
-                const card = createCard(item, sec.name, idx, sec.pal);
+                const card = createCard(item, sec.parent ? sec.parent + ' › ' + sec.name : sec.name, idx, sec.pal);
                 state = place(card, state, 10);
             });
         }
@@ -5433,7 +5971,8 @@ const ttsMap = [
 ];
 
 function humanizeLaTeX(text) {
-    let cleanText = String(text == null ? '' : text)
+    let cleanText = kaeriConvertTables(String(text == null ? '' : text), null, true)   // tables → spoken rows
+
         // Paragraph/line breaks become real newlines first, so markdown headings ("## Title") are still
         // recognised by the clean-up rules in ttsMap. They turn into spoken pauses further below.
         .replace(/<br\s*\/?>/gi, '\n')
@@ -5878,85 +6417,273 @@ function renderStudentBoard() {
     }
 }
 
+// ── KEYBOARD SHORTCUTS ──────────────────────────────────────
+//  Global        U ............ unlock (free users)      Esc ........ close modal, else back one screen
+//  MCQ / Essay   1-4 / A-D .... pick option              ↑ ↓ ← → .... move selection
+//                Enter ........ submit, then Next        Space / N .. Next
+//  Short answer  Enter ........ submit (Shift+Enter = new line)
+//  Pickers       1-9 .......... open the Nth button in a topic list
+//                A / N ........ All / None  (MCQ pickers only)
+//                Enter ........ Continue / Start  (MCQ pickers only)
+//                Backspace / B  Back one level  (Flashcard pickers)
+//  Flashcards    Mode screen: 1 = Standard, 2 = SRS
+//                Session: Space / Enter = flip, ← → (standard), 1-4 rate (SRS, answer shown)
+function _isTypingTarget(t) {
+    if (!t || !t.tagName) return false;
+    const tag = t.tagName;
+    if (tag === 'TEXTAREA' || tag === 'SELECT' || t.isContentEditable) return true;
+    if (tag === 'INPUT') {
+        const type = (t.getAttribute('type') || 'text').toLowerCase();
+        return !['radio', 'checkbox', 'button', 'submit', 'reset'].includes(type);
+    }
+    return false;
+}
+
+// Click the active "Next" button (shell action bar first, then the result area)
+function _clickNextButton() {
+    const shellBtns = document.querySelectorAll(".shell-actions button");
+    const nextBtn = shellBtns.length
+        ? shellBtns[shellBtns.length - 1]
+        : document.querySelector("#result button");
+    if (nextBtn) nextBtn.click();
+}
+
+// Is any modal / overlay currently open? (Escape should close it, not navigate)
+function _anyModalOpen() {
+    const pay   = document.getElementById('payment-modal');
+    const print = document.getElementById('print-preview-modal');
+    const doc   = document.getElementById('smart-doc-viewer');
+    return !!(
+        (pay   && pay.classList.contains('show'))   ||
+        (print && print.classList.contains('show')) ||
+        (doc   && doc.style.display && doc.style.display !== 'none') ||
+        document.querySelector('.r-modal.show')     ||
+        (typeof overlayStack !== 'undefined' && overlayStack.length > 0)
+    );
+}
+
+// Escape = one step back on the current screen (exitQuiz still confirms mid-quiz)
+function _handleEscapeBack(e) {
+    if (!currentQuizType) return;
+    const qf = document.getElementById('quiz-form');
+    if (!qf || !qf.childNodes.length) return;          // nothing on screen → nothing to leave
+
+    switch (currentQuizType) {
+        case 'mcq': case 'shortAnswer': case 'essay':
+        case 'mcqMenu': case 'essayMenu': case 'dashboard': case 'documents':
+            e.preventDefault(); exitQuiz(); return;
+        case 'mcqDemoUnit':
+            e.preventDefault(); exitQuiz(); return;
+        case 'mcqDemoSub':
+            e.preventDefault();
+            if (Object.keys(buildMcqTopicIndex(currentMcqData)).length > 1) renderDemoUnitPicker();
+            else exitQuiz();
+            return;
+        case 'mcqSubMenu': case 'mcqSetup':
+            e.preventDefault(); mcqSubBack(); return;
+        case 'flashcard': {
+            e.preventDefault();
+            if (qf.querySelector('.flashcard') || qf.querySelector('.back-to-topics-button')) { exitQuiz(); return; }
+            const back = qf.querySelector('.back-button');   // mode screen (Cancel) or "All topics"
+            if (back) back.click(); else exitQuiz();         // top-level picker → leave
+            return;
+        }
+    }
+}
+
 document.addEventListener("keydown", (e) => {
+    if (e.ctrlKey || e.metaKey || e.altKey || e.isComposing) return;   // never hijack browser shortcuts
+
+    const typing = _isTypingTarget(e.target);
+
+    if (e.key === "Escape") {
+        const modalWasOpen = _anyModalOpen();
+        closePaymentModal();
+        closePrintPreview();
+        closeDocViewer();
+        if (!modalWasOpen) _handleEscapeBack(e);
+        return;
+    }
+
+    // Short answer: Enter submits even from inside the textarea; once answered, Enter moves on
+    if (currentQuizType === "shortAnswer" && e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        if (e.repeat) return;
+        if (isSubmissionLocked) {
+            if (!document.getElementById('final-anchor')) _clickNextButton();
+        } else {
+            checkShortAnswer();
+        }
+        return;
+    }
+
+    // Enter submits the modal inputs that have a submit button next to them
+    if (e.key === "Enter" && !e.shiftKey && e.target && e.target.id) {
+        const submitters = {
+            'access-code-input': verifyCodeFromModal,
+            'checkEmail':        checkHistory,
+            'referral-email':    submitAmbassadorReferral
+        };
+        const fn = submitters[e.target.id];
+        if (fn) { e.preventDefault(); if (!e.repeat) fn(); return; }
+    }
+
+    // Everything below must not fire while the student is typing in a field
+    if (typing) return;
+
     if ((e.key === 'u' || e.key === 'U') && currentCourse && !hasFullAccess) {
         e.preventDefault();
         openPaymentModal();
-        return; 
+        return;
     }
-    
+
     if (!currentQuizType) return;
-    
+
+    // --- SHORT ANSWER (after submit): Space / N → Next, like MCQ ---
+    if (currentQuizType === "shortAnswer") {
+        if (isSubmissionLocked && (e.key === " " || e.key === "n" || e.key === "N")
+            && !document.getElementById('final-anchor')) {
+            e.preventDefault();
+            if (!e.repeat) _clickNextButton();
+        }
+        return;
+    }
+
+    // --- MCQ / ESSAY ---
     if (currentQuizType === "mcq" || currentQuizType === "essay") {
-        const options = document.querySelectorAll('input[type="radio"]');
-        const selected = document.querySelector('input[type="radio"]:checked');
+        const options = document.querySelectorAll('input[type="radio"]:not(:disabled)');   // locked after submit
+        const selected = document.querySelector('input[type="radio"]:not(:disabled):checked');
         let index = Array.from(options).indexOf(selected);
+
+        const goNext = _clickNextButton;
+
         switch (e.key) {
             case "ArrowDown": case "ArrowRight":
-                if (options.length) { index = (index + 1) % options.length; options[index].checked = true; } break;
+                if (options.length) { e.preventDefault(); index = (index + 1) % options.length; options[index].checked = true; } break;
             case "ArrowUp": case "ArrowLeft":
-                if (options.length) { index = (index - 1 + options.length) % options.length; options[index].checked = true; } break;
+                if (options.length) { e.preventDefault(); index = (index - 1 + options.length) % options.length; options[index].checked = true; } break;
             case "1": case "a": case "A": if (options[0]) options[0].checked = true; break;
             case "2": case "b": case "B": if (options[1]) options[1].checked = true; break;
             case "3": case "c": case "C": if (options[2]) options[2].checked = true; break;
             case "4": case "d": case "D": if (options[3]) options[3].checked = true; break;
             case "Enter":
-                if (currentQuizType === "mcq") checkMcqAnswer();
-                if (currentQuizType === "essay") checkEssayStep();
+                e.preventDefault();
+                if (options.length) {                       // question still open → submit
+                    if (currentQuizType === "mcq") checkMcqAnswer();
+                    if (currentQuizType === "essay") checkEssayStep();
+                } else {                                    // already answered → Next
+                    goNext();
+                }
                 break;
-            case " ": case "n": case "N": {
-                // Prefer the shell action bar's last button if it exists (new pattern),
-                // otherwise fall back to the legacy "#result button" (original pattern).
-                const shellBtns = document.querySelectorAll(".shell-actions button");
-                const nextBtn = shellBtns.length
-                    ? shellBtns[shellBtns.length - 1]
-                    : document.querySelector("#result button");
-                if (nextBtn) nextBtn.click();
+            case " ": case "n": case "N":
+                e.preventDefault();
+                goNext();
                 break;
-            }
         }
+        return;
     }
-    
-    if (currentQuizType === "shortAnswer" && e.key === "Enter" && !e.shiftKey) {
-        e.preventDefault(); 
-        checkShortAnswer();
-    }
-    
-    if (currentQuizType === "flashcard") {
-        if (e.key === " " || e.key === "Enter") {
-             e.preventDefault(); // Stop scrolling
-             if (isCardFront) flipCard();
-             else if (currentFlashcardMode === 'linear') flipCard(); // Allow flip back in linear
-        }
 
-        if (currentFlashcardMode === 'linear') {
-            // Linear Shortcuts
-            if (e.key === "ArrowLeft") prevFlashcard();
-            if (e.key === "ArrowRight") nextFlashcard();
-        } else {
-            // SRS Shortcuts (Only when answer shown)
-            if (!isCardFront) {
+    // --- FLASHCARDS (session, mode screen, pickers) ---
+    if (currentQuizType === "flashcard") {
+        const inSession = !!document.querySelector('#quiz-form .flashcard');
+        if (inSession) {
+            if (e.key === " " || e.key === "Enter") {
+                e.preventDefault();                                   // stop scrolling / button double-fire
+                if (isCardFront) flipCard();
+                else if (currentFlashcardMode === 'linear') flipCard(); // flip back in linear
+            }
+            if (currentFlashcardMode === 'linear') {
+                if (e.key === "ArrowLeft") prevFlashcard();
+                if (e.key === "ArrowRight") nextFlashcard();
+            } else if (!isCardFront) {
                 if (e.key === "1") rateCard(0);
                 if (e.key === "2") rateCard(3);
                 if (e.key === "3") rateCard(4);
                 if (e.key === "4") rateCard(5);
             }
+            return;
+        }
+        // Pickers and mode screen: Backspace / B → one level back (Cancel / All topics)
+        if (e.key === "Backspace" || e.key === "b" || e.key === "B") {
+            const backBtn = document.querySelector('#quiz-form .back-button');
+            if (backBtn) { e.preventDefault(); if (!e.repeat) backBtn.click(); }
+            return;
+        }
+        // Mode-selection screen: 1 = Standard, 2 = SRS
+        const modeBtns = document.querySelectorAll('#quiz-form button[onclick^="startFlashcards("]');
+        if (modeBtns.length) {
+            if (e.repeat) return;
+            if (e.key === "1" && modeBtns[0]) modeBtns[0].click();
+            if (e.key === "2" && modeBtns[1]) modeBtns[1].click();
+            return;
         }
     }
-    
-    if (e.key === "Escape") {
-        closePaymentModal();
-        closePrintPreview();
-        closeDocViewer();
+
+    // --- MCQ DEMO / PAID SCREENS ---------------------------------
+    // 1-9 pick/toggle the Nth row · A = all · N = none · Enter = continue/start
+    if (currentQuizType === "mcqDemoUnit" || currentQuizType === "mcqDemoSub"
+        || currentQuizType === "mcqMenu"  || currentQuizType === "mcqSubMenu"
+        || currentQuizType === "mcqSetup") {
+        if (e.repeat) return;
+        const rowSel = {
+            mcqDemoUnit: '.demo-mcq-unit-row',
+            mcqDemoSub:  '.demo-mcq-sub-row',
+            mcqMenu:     '.mcq-unit-row',
+            mcqSubMenu:  '.mcq-sub-row'
+        }[currentQuizType];
+
+        if (rowSel && /^[1-9]$/.test(e.key)) {
+            const row = document.querySelectorAll(rowSel)[parseInt(e.key, 10) - 1];
+            if (row) {
+                e.preventDefault();
+                const cb = row.querySelector('input[type=checkbox]');
+                if (cb) cb.click(); else row.click();
+            }
+            return;
+        }
+        const k = e.key.toLowerCase();
+        if (currentQuizType === "mcqDemoSub") {
+            if (k === 'a') { e.preventDefault(); demoSelectAllSubs(true);  return; }
+            if (k === 'n') { e.preventDefault(); demoSelectAllSubs(false); return; }
+            if (e.key === "Enter") {
+                const btn = document.getElementById('demo-mcq-start');
+                if (btn && !btn.disabled) { e.preventDefault(); startDemoSubTopicMcq(); }
+                return;
+            }
+        } else if (currentQuizType === "mcqMenu") {
+            if (k === 'a') { e.preventDefault(); mcqMenuSelectAllUnits(true);  return; }
+            if (k === 'n') { e.preventDefault(); mcqMenuSelectAllUnits(false); return; }
+            if (e.key === "Enter") { e.preventDefault(); mcqMenuContinue(); return; }
+        } else if (currentQuizType === "mcqSubMenu") {
+            const unit = mcqSetupState.orderedUnits[mcqSetupState.subScreenIndex];
+            if (k === 'a') { e.preventDefault(); mcqSubSelectAll(unit, true);  return; }
+            if (k === 'n') { e.preventDefault(); mcqSubSelectAll(unit, false); return; }
+            if (e.key === "Enter") { e.preventDefault(); mcqSubContinue(); return; }
+        } else if (currentQuizType === "mcqSetup") {
+            if (e.key === "Enter") { e.preventDefault(); startSelectedMcq(); return; }
+        }
+        return;
+    }
+
+    // --- TOPIC / ESSAY PICKERS: 1-9 opens the Nth entry ---
+    if (/^[1-9]$/.test(e.key) && !e.repeat) {   // held key must not chain Parent → Subtopic → start
+        const pickerBtns = document.querySelectorAll('#quiz-form .flashcard-topic-buttons > button');
+        const btn = pickerBtns[parseInt(e.key, 10) - 1];
+        if (btn) btn.click();
     }
 });
 
 // Guard against accidental refresh while a quiz is in progress.
 // Scoped to MCQ / SA / Essay (flashcards don't hold unsaved progress).
 window.addEventListener('beforeunload', function (e) {
-    const active = ['mcq', 'shortAnswer', 'essay'].includes(currentQuizType)
-        && currentQuizData.length > 0
-        && currentQuestionIndex < currentQuizData.length;
+    let active = false;
+    if (currentQuizType === 'mcq' || currentQuizType === 'shortAnswer') {
+        active = currentQuizData.length > 0
+              && currentQuestionIndex < currentQuizData.length;
+    } else if (currentQuizType === 'essay') {
+        // Essay advances via currentStepIndex; the final score screen carries #final-anchor.
+        active = !!currentEssay && !document.getElementById('final-anchor');
+    }
     if (active) {
         e.preventDefault();
         e.returnValue = '';
@@ -6303,7 +7030,7 @@ function confirmExitQuiz() {
 })();
 
 // Setup screens always start from "no quiz running" (hides the strip), then run the original
-['renderQuiz', 'renderShortAnswers', 'renderEssaySimulation', 'renderFlashcardTopics'].forEach(name => {
+['renderQuiz', 'renderShortAnswers', 'renderEssaySimulation', 'renderFlashcardTopics', 'renderFlashcardSubtopics'].forEach(name => {
     const orig = window[name];
     if (typeof orig !== 'function') return;
     window[name] = function () { updateProgress(0, 0); const out = orig.apply(this, arguments); _focusScreen(); return out; };
@@ -6340,8 +7067,8 @@ function _addSoftPitch() {
                         <h3 style="margin:8px 0;">No Progress Yet</h3>
                         <p style="color:#a0a8b4; margin:0;">Finish a quiz or review some flashcards and your stats will show up here.</p>
                         <div class="ep-actions">
-                            <button type="button" onclick="renderQuiz()" style="background:#007bff;color:#fff;border:none;padding:12px 18px;border-radius:8px;">Start MCQ Quiz</button>
-                            <button type="button" onclick="renderFlashcardTopics()" style="background:#6f42c1;color:#fff;border:none;padding:12px 18px;border-radius:8px;">Study Flashcards</button>
+                            ${_modeAvailability().renderQuiz ? '<button type="button" onclick="renderQuiz()" style="background:#007bff;color:#fff;border:none;padding:12px 18px;border-radius:8px;">Start MCQ Quiz</button>' : ''}
+                            ${_modeAvailability().renderFlashcardTopics ? '<button type="button" onclick="renderFlashcardTopics()" style="background:#6f42c1;color:#fff;border:none;padding:12px 18px;border-radius:8px;">Study Flashcards</button>' : ''}
                         </div>
                         <button type="button" onclick="exitQuiz()" class="back-button">⬅️ Back to Course</button>
                     </div>`;
@@ -6565,6 +7292,7 @@ document.addEventListener('DOMContentLoaded', function () {
             console.warn('[config] live prices unavailable:', err && err.message);
             refreshPriceUI();
         });
+        startConfigSync();
     } catch (e) {}
     try { _cleanupRetiredMcqSrs(); } catch (e) {}
     initDraggableWhatsApp();
