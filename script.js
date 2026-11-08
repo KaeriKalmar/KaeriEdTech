@@ -598,6 +598,26 @@ const _docsCache = {};        // termKey → documents list from the Gatekeeper 
 const EXTRA_TERMS = {};
 const _MODE_FNS = ['renderQuiz', 'renderShortAnswers', 'renderEssaySimulation', 'renderFlashcardTopics'];
 
+// While a term's modes are still loading, the mode grid shows the app's own shimmering skeleton
+// (the .skeleton class used by the Documents library) instead of sitting empty.
+let _modesLoading = false;       // true from the moment a term is tapped until its data is confirmed
+let _docsPendingFor = null;      // termKey whose Documents list is still being fetched
+
+function _renderModeSkeleton() {
+    const grid = document.querySelector('.mode-buttons');
+    if (!grid) return;
+    grid.querySelectorAll('.mode-skel').forEach(function (el) { el.remove(); });
+    const count = _modesLoading ? 4 : ((_docsPendingFor && _docsPendingFor === currentTermKey) ? 1 : 0);
+    if (count) grid.setAttribute('aria-busy', 'true'); else grid.removeAttribute('aria-busy');
+    for (let i = 0; i < count; i++) {
+        const tile = document.createElement('div');
+        tile.className = 'skeleton mode-skel';
+        tile.setAttribute('aria-hidden', 'true');
+        tile.style.cssText = 'height:52px; min-height:52px; width:100%; border-radius:8px;';
+        grid.insertBefore(tile, grid.firstChild);
+    }
+}
+
 function _setModeFailed(termKey, kind, val) {
     (_modeLoadFailed[termKey] = _modeLoadFailed[termKey] || {})[kind] = !!val;
 }
@@ -625,6 +645,9 @@ function hideModeButtons() {
     });
     const docsBtn = document.getElementById('docs-btn');
     if (docsBtn) docsBtn.style.display = 'none';
+    _modesLoading = true;
+    _docsPendingFor = null;
+    _renderModeSkeleton();
 }
 
 function applyModeAvailability() {
@@ -635,6 +658,8 @@ function applyModeAvailability() {
     });
     const docsBtn = document.getElementById('docs-btn');
     if (docsBtn) docsBtn.style.display = has.renderDocuments ? '' : 'none';
+    _modesLoading = false;
+    _renderModeSkeleton();
 }
 
 // "Switch Learning Mode" panels on finish screens: drop modes with no data.
@@ -681,7 +706,9 @@ async function _fetchDocsForTerm(termKey, course, term) {
 
 async function _loadDocsAvailability(termKey, course, term, attempt) {
     attempt = attempt || 1;
+    if (!_docsCache[termKey]) { _docsPendingFor = termKey; _renderModeSkeleton(); }   // one shimmer tile until Documents is known
     const list = await _fetchDocsForTerm(termKey, course, term);
+    if (_docsPendingFor === termKey) _docsPendingFor = null;
     if (currentTermKey !== termKey) return;
     applyModeAvailability();
     if (list === null && attempt < 3) {
