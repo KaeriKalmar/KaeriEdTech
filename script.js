@@ -603,18 +603,31 @@ const _MODE_FNS = ['renderQuiz', 'renderShortAnswers', 'renderEssaySimulation', 
 let _modesLoading = false;       // true from the moment a term is tapped until its data is confirmed
 let _docsPendingFor = null;      // termKey whose Documents list is still being fetched
 
+// IMPORTANT: must stay idempotent — it removes any existing tiles first and rebuilds from state, because
+// it is called from hideModeButtons, applyModeAvailability, _loadDocsAvailability and the retry paths.
 function _renderModeSkeleton() {
     const grid = document.querySelector('.mode-buttons');
     if (!grid) return;
     grid.querySelectorAll('.mode-skel').forEach(function (el) { el.remove(); });
-    const count = _modesLoading ? 4 : ((_docsPendingFor && _docsPendingFor === currentTermKey) ? 1 : 0);
-    if (count) grid.setAttribute('aria-busy', 'true'); else grid.removeAttribute('aria-busy');
-    for (let i = 0; i < count; i++) {
-        const tile = document.createElement('div');
-        tile.className = 'skeleton mode-skel';
-        tile.setAttribute('aria-hidden', 'true');
-        tile.style.cssText = 'height:52px; min-height:52px; width:100%; border-radius:8px;';
-        grid.insertBefore(tile, grid.firstChild);
+    const docsPending = !_modesLoading && !!_docsPendingFor && _docsPendingFor === currentTermKey;
+    if (_modesLoading || docsPending) grid.setAttribute('aria-busy', 'true'); else grid.removeAttribute('aria-busy');
+
+    function tile(first) {
+        const t = document.createElement('div');
+        t.className = 'skeleton mode-skel';
+        t.setAttribute('aria-hidden', 'true');
+        // Appended (never prepended) so the positional insert of the Documents button in
+        // initializeCourseLogic (children[1]) still lands on the right slot; order:-1 draws them first.
+        t.style.cssText = 'height:52px; min-height:52px; width:100%; border-radius:8px;' + (first ? ' order:-1;' : '');
+        return t;
+    }
+    if (_modesLoading) {
+        for (let i = 0; i < 4; i++) grid.appendChild(tile(true));
+    } else if (docsPending) {
+        // One tile in the Documents button's own slot until its list is known.
+        const docsBtn = document.getElementById('docs-btn');
+        if (docsBtn && docsBtn.parentNode === grid) grid.insertBefore(tile(false), docsBtn);
+        else grid.appendChild(tile(false));
     }
 }
 
