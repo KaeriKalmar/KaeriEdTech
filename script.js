@@ -25,7 +25,7 @@ const KAERI_CONFIG = {
     // ─── THE ONLY TWO ACTIVE BACKENDS ───
     
     // 1. Gatekeeper Backend (Auth, Docs, Analytics)
-    gatekeeperUrl:      "https://script.google.com/macros/s/AKfycbyEgfRxU4Z6kdehvNcJloabFmwldB9CExr26G9SNHSGppTVIeGTMKFYAPz-x-eSCXuiVg/exec",
+    gatekeeperUrl:      "https://script.google.com/macros/s/AKfycbz3fmZTcATs1dofaJ-ZEOD3asePLaOAXdQeRAj0r97DZXyfZ3Od5POL9Kocg6PCz6sV/exec",
     
     // 2. AMB-PAY Backend (Payments, Config, Bridge)
     ambPayUrl:          "https://script.google.com/macros/s/AKfycbzeN2ZWwnBReNQnvu_1GUr6qZMGmTNUi2e7-byJnFtkJRs6st2LyGyAgBKDwaP9jv5S/exec",
@@ -929,11 +929,57 @@ function injectDocViewerHTML() {
             <div id="doc-loader-overlay" class="viewer-loader">
                 <div class="viewer-skeleton-box"></div>
                 <p id="doc-loader-text" style="color:#72efdd; margin-top:20px; font-size:0.9em;">Verifying access...</p>
+                <!-- Download progress (shown only while a file is being downloaded) -->
+                <div id="doc-progress-wrap" style="display:none; width:80%; max-width:420px; margin-top:12px; text-align:center;">
+                    <div class="dp-track"><div id="doc-progress-fill" class="dp-fill"></div></div>
+                    <div style="display:flex; justify-content:space-between; margin-top:6px; font-size:0.8em; color:#a0a8b4;">
+                        <span id="doc-progress-pct">0%</span>
+                        <span id="doc-progress-detail"></span>
+                    </div>
+                    <button onclick="closeDocViewer()" style="margin-top:10px; background:transparent; color:#a0a8b4; border:1px solid #3e506e; padding:5px 14px; border-radius:6px; cursor:pointer; font-size:0.8em;">Cancel</button>
+                </div>
             </div>
 
-            <!-- The Iframe -->
-            <iframe id="doc-frame" style="flex:1; width:100%; border:none; background:white;" allow="autoplay; fullscreen" allowfullscreen></iframe>
+            <!-- PDF.js canvas container (pages are drawn here) -->
+            <div id="pdf-canvas-container" style="flex:1; overflow-y:auto; padding:20px; display:flex; flex-direction:column; align-items:center; background:#222; gap:15px;">
+                <!-- PDF.js will inject <canvas> elements here -->
+            </div>
             
+            <!-- Document voice reader (TTS) -->
+            <style>
+                .dp-track { height:10px; background:#2b3a55; border-radius:6px; overflow:hidden; }
+                .dp-fill { height:100%; width:0%; background:linear-gradient(90deg,#72efdd,#4ea8de); border-radius:6px; transition:width .25s ease; }
+                #doc-reader-bar .dr-row { display:flex; align-items:center; justify-content:center; flex-wrap:wrap; gap:6px; padding:8px 10px; }
+                #doc-reader-bar .dr-btn { min-width:40px; height:38px; padding:0 10px; border-radius:8px; border:1px solid #3e506e; background:#1a1a2e; color:#fff; font-size:1em; cursor:pointer; }
+                #doc-reader-bar .dr-btn:disabled { opacity:.4; cursor:default; }
+                #doc-reader-bar .dr-primary { background:#72efdd; color:#0d1b2a; border-color:#72efdd; font-weight:bold; min-width:46px; }
+                #doc-reader-bar .dr-page { color:#e0e6ed; font-size:.85em; min-width:84px; text-align:center; }
+                #doc-reader-bar .dr-status { color:#72efdd; font-size:.8em; }
+                #doc-reader-bar .dr-set label { display:block; color:#a0a8b4; font-size:.8em; margin:8px 0 4px; }
+                #doc-reader-bar .dr-set select { width:100%; padding:9px; border-radius:8px; background:#1a1a2e; color:#fff; border:1px solid #3e506e; }
+                #doc-reader-bar .dr-set input[type=range] { width:100%; }
+                @media (max-width:480px) { #doc-reader-bar .dr-status { display:none; } }
+            </style>
+            <div id="doc-reader-bar" style="display:none; background:#0d1b2a; border-top:1px solid #3e506e;">
+                <div id="doc-reader-settings" class="dr-set" style="display:none; padding:6px 14px 10px; border-bottom:1px solid #3e506e;">
+                    <label for="dr-voice">Voice</label>
+                    <select id="dr-voice" onchange="setTtsVoice(this.value)"></select>
+                    <label for="dr-rate">Speed: <span id="dr-rate-label">1×</span></label>
+                    <input type="range" id="dr-rate" min="0.5" max="2" step="0.25" value="1" oninput="setTtsRate(this.value); _docReaderSyncUi();">
+                    <div style="color:#7d8797; font-size:.72em; margin-top:6px;">Voice and speed changes apply from the next sentence.</div>
+                </div>
+                <div class="dr-row">
+                    <button id="dr-play" class="dr-btn dr-primary" onclick="docReaderToggle()" aria-label="Read aloud">▶</button>
+                    <button id="dr-prev" class="dr-btn" onclick="docReaderStep(-1)" aria-label="Previous page">⏮</button>
+                    <span id="dr-page" class="dr-page">Page 1 / 1</span>
+                    <button id="dr-next" class="dr-btn" onclick="docReaderStep(1)" aria-label="Next page">⏭</button>
+                    <button id="dr-stop" class="dr-btn" onclick="docReaderStop()" aria-label="Stop reading" disabled>⏹</button>
+                    <button id="dr-speed" class="dr-btn" onclick="docReaderCycleSpeed()" aria-label="Reading speed">1×</button>
+                    <button class="dr-btn" onclick="docReaderToggleSettings()" aria-label="Reader settings">🎛️</button>
+                    <span id="dr-status" class="dr-status">🎧 Read aloud</span>
+                </div>
+            </div>
+
             <div style="text-align:center; color:#888; font-size:0.75em; padding:5px; background:#0d1b2a; border-top:1px solid #3e506e;">
                 Protected Content - Kaeri EdTech
             </div>
@@ -946,44 +992,528 @@ function injectDocViewerHTML() {
 // ── Stage 1: show the modal + shimmer skeleton IMMEDIATELY (instant feedback on tap) ──
 function showDocViewerLoading(title) {
     const viewer = document.getElementById('smart-doc-viewer');
-    const iframe = document.getElementById('doc-frame');
+    const container = document.getElementById('pdf-canvas-container');
     const titleEl = document.getElementById('viewer-title');
     const loader = document.getElementById('doc-loader-overlay');
     const loaderText = document.getElementById('doc-loader-text');
     
-    if (!viewer || !iframe) {
+    if (!viewer || !container) {
         injectDocViewerHTML();
         setTimeout(() => showDocViewerLoading(title), 50);
         return;
     }
     
     titleEl.textContent = title || "Document";
-    iframe.src = "";                                      // Clear previous to prevent ghosting
+    container.innerHTML = "";                             // Clear previous to prevent ghosting
+    _docResetUi();                                        // clear progress bar + voice reader from any previous document
     if (loaderText) loaderText.textContent = 'Verifying access...';
     if (loader) loader.style.display = 'flex';            // Show shimmer right now
     viewer.style.display = 'flex';
     document.body.style.overflow = 'hidden';
 }
 
-// ── Stage 2: load the iframe (only called AFTER verification succeeds) ──
-function loadDocInViewer(fileId, title) {
-    const iframe = document.getElementById('doc-frame');
+// ── Offline document cache (IndexedDB) ──
+const OFFLINE_DB_NAME = 'kaeri_offline_docs';
+const STORE_NAME = 'documents';
+
+function getDb() {
+    return new Promise((resolve, reject) => {
+        if (!window.indexedDB) { reject(new Error('IndexedDB not supported')); return; }
+        const req = indexedDB.open(OFFLINE_DB_NAME, 1);
+        req.onupgradeneeded = () => {
+            const db = req.result;
+            if (!db.objectStoreNames.contains(STORE_NAME)) db.createObjectStore(STORE_NAME);
+        };
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+    });
+}
+
+async function getOfflineDoc(fileId) {
+    try {
+        const db = await getDb();
+        return await new Promise((resolve) => {
+            const req = db.transaction(STORE_NAME, 'readonly').objectStore(STORE_NAME).get(fileId);
+            req.onsuccess = () => resolve(req.result || null);
+            req.onerror = () => resolve(null);
+        });
+    } catch (e) { return null; }
+}
+
+async function saveDocOffline(fileId, base64Data) {
+    try {
+        const db = await getDb();
+        await new Promise((resolve) => {
+            const tx = db.transaction(STORE_NAME, 'readwrite');
+            tx.objectStore(STORE_NAME).put(base64Data, fileId);
+            tx.oncomplete = () => resolve(true);
+            tx.onerror = () => resolve(false);   // e.g. storage full: viewing still works, just not cached
+            tx.onabort = () => resolve(false);
+        });
+    } catch (e) { /* caching is best-effort */ }
+}
+
+async function clearOfflineDocs() {
+    try {
+        const db = await getDb();
+        await new Promise((resolve) => {
+            const tx = db.transaction(STORE_NAME, 'readwrite');
+            tx.objectStore(STORE_NAME).clear();
+            tx.oncomplete = () => resolve(true);
+            tx.onerror = () => resolve(false);
+            tx.onabort = () => resolve(false);
+        });
+        console.log("Offline document cache purged.");
+    } catch (e) {
+        console.error("Failed to clear offline cache", e);
+    }
+}
+
+// ── Stage 2: render the PDF with PDF.js (only called AFTER verification succeeds) ──
+let _docRenderId = 0;   // bumped whenever the viewer closes, so an in-flight render stops itself
+
+async function renderPdfFromBase64(base64Data, title) {
+    const container = document.getElementById('pdf-canvas-container');
     const loader = document.getElementById('doc-loader-overlay');
-    const loaderText = document.getElementById('doc-loader-text');
-    if (!iframe) return;
+    if (!container) return;
+    const myRenderId = ++_docRenderId;
+    const _lt = document.getElementById('doc-loader-text');
+    if (_lt) _lt.textContent = 'Preparing document...';
+    container.innerHTML = ''; // Clear previous document
 
-    // Update the shimmer text: verification is done, now the document is loading
-    if (loaderText) loaderText.textContent = 'Loading preview...';
+    try {
+        if (typeof pdfjsLib === 'undefined') throw new Error('PDF.js not loaded');
 
-    iframe.src = `https://drive.google.com/file/d/${fileId}/preview`;
-    iframe.onload = function () {
-        // Small buffer to ensure rendering has started
-        setTimeout(() => {
-            if (loader) loader.style.display = 'none';
-        }, 500);
+        // Convert Base64 to Binary
+        const binaryString = atob(base64Data);
+        const bytes = new Uint8Array(binaryString.length);
+        for (let i = 0; i < binaryString.length; i++) {
+            bytes[i] = binaryString.charCodeAt(i);
+        }
+
+        // Load with PDF.js
+        const pdf = await pdfjsLib.getDocument({ data: bytes }).promise;
+        if (myRenderId !== _docRenderId) return;   // viewer was closed meanwhile
+        _docPdf = pdf;
+        _docReaderInit(pdf.numPages);              // voice reader becomes available
+
+        // Hide loader, show page count
+        if (loader) loader.style.display = 'none';
+        const titleEl = document.getElementById('viewer-title');
+        if (titleEl) titleEl.textContent = title + ' (' + pdf.numPages + ' pages)';
+
+        // Render every page
+        for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
+            const page = await pdf.getPage(pageNum);
+            if (myRenderId !== _docRenderId) return;
+            const viewport = page.getViewport({ scale: 1.5 }); // Scale 1.5 makes it readable on mobile
+
+            const canvas = document.createElement('canvas');
+            const context = canvas.getContext('2d');
+            canvas.height = viewport.height;
+            canvas.width = viewport.width;
+            canvas.dataset.page = pageNum;
+            canvas.style.maxWidth = '100%';
+            canvas.style.boxShadow = '0 4px 10px rgba(0,0,0,0.5)';
+            canvas.style.background = 'white';
+            container.appendChild(canvas);
+
+            await page.render({ canvasContext: context, viewport: viewport }).promise;
+        }
+
+        // Fire-and-forget analytics
+        logAnalyticsEvent('document_view', `Viewed: ${title}`);
+    } catch (err) {
+        console.error(err);
+        if (myRenderId !== _docRenderId) return;
+        if (loader) loader.style.display = 'none';
+        container.innerHTML = '<p style="color:#dc3545; text-align:center;">Failed to render PDF. The file might be corrupted or not a PDF.</p>';
+    }
+}
+
+// ============================================================
+// === DOWNLOAD PROGRESS BAR (shown while a PDF downloads) ===
+// The server work (reading the file from Drive) sends no bytes, so that wait is an
+// estimate that creeps towards 30%. The transfer itself is real: bytes received vs the
+// expected size. Everything is capped at 96% until the file has fully arrived.
+// ============================================================
+let _docAbort = null;
+let _docProgTimer = null;
+const _docProg = { shown: 0, stage: 'idle', start: 0, got: 0, total: 0 };
+
+function _fmtBytes(n) {
+    if (n >= 1048576) return (n / 1048576).toFixed(1) + ' MB';
+    return Math.max(1, Math.round(n / 1024)) + ' KB';
+}
+
+/** Expected size of the Base64 download, from the Documents sheet "FileSize" (e.g. "4.04 MB"). 0 = unknown. */
+function _expectedDocBytes(fileId) {
+    try {
+        const list = _docsCache[currentTermKey] || [];
+        const d = list.find(x => String(x.fileId) === String(fileId));
+        if (!d || !d.size) return 0;
+        const m = String(d.size).trim().match(/^([\d.,]+)\s*(B|KB|MB|GB)?$/i);
+        if (!m) return 0;
+        const n = parseFloat(m[1].replace(/,/g, ''));
+        if (!isFinite(n) || n <= 0) return 0;
+        const mult = { B: 1, KB: 1024, MB: 1048576, GB: 1073741824 }[(m[2] || 'B').toUpperCase()];
+        return Math.round(n * mult * 4 / 3) + 400;   // Base64 inflates by 4/3, plus the JSON envelope
+    } catch (e) { return 0; }
+}
+
+function _docProgressRender() {
+    const p = _docProg;
+    const fill = document.getElementById('doc-progress-fill');
+    const pct = document.getElementById('doc-progress-pct');
+    const det = document.getElementById('doc-progress-detail');
+    if (fill) fill.style.width = p.shown + '%';
+    if (pct) pct.textContent = Math.floor(p.shown) + '%';
+    if (det) {
+        det.textContent = p.stage === 'server' ? 'Preparing file...'
+                        : p.stage === 'transfer' ? (p.got ? _fmtBytes(p.got) + ' received' : 'Starting download...')
+                        : p.stage === 'done' ? 'Done' : '';
+    }
+}
+
+function _docProgressTick() {
+    const p = _docProg;
+    const t = (Date.now() - p.start) / 1000;
+    let target = 0;
+    if (p.stage === 'server') {
+        target = 30 * (1 - Math.exp(-t / 5));                       // creeps towards 30%, never reaches it
+    } else if (p.stage === 'transfer') {
+        const frac = p.total > 0 ? Math.min(p.got / p.total, 1)     // real: bytes received / expected
+                                 : 1 - Math.exp(-p.got / 1500000);  // size unknown: smooth curve
+        target = 30 + 65 * frac;
+    }
+    p.shown = Math.max(p.shown, Math.min(target, 96));
+    _docProgressRender();
+}
+
+function _docProgressStart() {
+    clearInterval(_docProgTimer);
+    Object.assign(_docProg, { shown: 0, stage: 'server', start: Date.now(), got: 0, total: 0 });
+    const wrap = document.getElementById('doc-progress-wrap');
+    if (wrap) wrap.style.display = 'block';
+    _docProgressRender();
+    _docProgTimer = setInterval(_docProgressTick, 150);
+}
+
+function _docProgressFinish() {
+    clearInterval(_docProgTimer); _docProgTimer = null;
+    _docProg.stage = 'done'; _docProg.shown = 100;
+    _docProgressRender();
+}
+
+function _docProgressStop() {
+    clearInterval(_docProgTimer); _docProgTimer = null;
+    _docProg.stage = 'idle'; _docProg.shown = 0;
+    const wrap = document.getElementById('doc-progress-wrap');
+    if (wrap) wrap.style.display = 'none';
+    _docProgressRender();
+}
+
+/** POST to the Gatekeeper and stream the response so the bar can show real progress. Returns the parsed JSON. */
+async function _fetchDocWithProgress(body, expectedBytes, signal) {
+    _docProgressStart();
+    const res = await fetch(APPS_SCRIPT_URL, {
+        method: 'POST',
+        headers: { "Content-Type": "text/plain;charset=utf-8" },
+        body: body,
+        signal: signal
+    });
+    const len = parseInt(res.headers.get('Content-Length'), 10);
+    _docProg.total = (isFinite(len) && len > 0) ? len : expectedBytes;
+    _docProg.stage = 'transfer';
+
+    if (!res.body || !res.body.getReader) return await res.json();   // old browser: no streaming, bar just jumps
+
+    const reader = res.body.getReader();
+    const chunks = [];
+    while (true) {
+        const part = await reader.read();
+        if (part.done) break;
+        chunks.push(part.value);
+        _docProg.got += part.value.length;
+    }
+    const all = new Uint8Array(_docProg.got);
+    let off = 0;
+    for (let i = 0; i < chunks.length; i++) { all.set(chunks[i], off); off += chunks[i].length; }
+    chunks.length = 0;
+    return JSON.parse(new TextDecoder().decode(all));
+}
+
+// ============================================================
+// === DOCUMENT VOICE READER (TTS) ===
+// Reads the open PDF aloud page by page with the app's existing Smart TTS engine
+// (voice, speed, pausing, maths clean-up). Works offline with on-device voices.
+// ============================================================
+let _docPdf = null;
+const _docTextCache = {};
+const _docReader = { active: false, busy: false, internal: false, token: 0, page: 1, total: 0 };
+const _DOC_RATES = [0.75, 1, 1.25, 1.5, 1.75, 2];
+let _docScrollBound = false;
+
+/** Turn PDF.js text items into clean, speakable text: rebuild lines, join wrapped lines, de-hyphenate, drop page numbers. */
+function _docBuildPageText(items) {
+    const lines = [];
+    let cur = '', prev = null;
+    function flush() { if (cur.trim()) lines.push(cur); cur = ''; prev = null; }
+    for (let i = 0; i < items.length; i++) {
+        const it = items[i];
+        const str = it.str || '';
+        const tr = it.transform || [1, 0, 0, 1, 0, 0];
+        if (prev && Math.abs(tr[5] - prev.tr[5]) > 2) flush();   // new baseline = new line
+        if (str) {
+            if (prev) {
+                const gap = tr[4] - (prev.tr[4] + (prev.w || 0));
+                const fs = Math.abs(tr[0]) || 10;
+                if (gap > fs * 0.2 && !/\s$/.test(cur) && !/^\s/.test(str)) cur += ' ';
+            }
+            cur += str;
+            prev = { tr: tr, w: it.width || 0 };
+        }
+        if (it.hasEOL) flush();
+    }
+    flush();
+
+    const L = lines
+        .map(l => l.replace(/[­]/g, '')
+                   .replace(/ﬁ/g, 'fi').replace(/ﬂ/g, 'fl').replace(/ﬀ/g, 'ff')
+                   .replace(/ﬃ/g, 'ffi').replace(/ﬄ/g, 'ffl')
+                   .replace(/^[•●▪■◦○·-]\s*/, '')
+                   .replace(/\s+/g, ' ').trim())
+        .filter(l => l && !/^(page\s*)?\d{1,3}(\s*(of|\/)\s*\d{1,3})?$/i.test(l));   // lone page numbers
+
+    let text = '';
+    for (let i = 0; i < L.length; i++) {
+        if (!text) { text = L[i]; continue; }
+        const before = L[i - 1];
+        if (/[A-Za-z]-$/.test(before) && /^[a-z]/.test(L[i])) text = text.slice(0, -1) + L[i];      // de-hyphenate
+        else if (/[.!?:;]$/.test(before) || before.length < 45) text += '\n' + L[i];                 // heading / bullet / sentence end
+        else text += ' ' + L[i];                                                                      // wrapped mid-sentence
+    }
+    return text.trim();
+}
+
+async function _docPageText(n) {
+    if (_docTextCache[n] !== undefined) return _docTextCache[n];
+    if (!_docPdf || n < 1 || n > _docReader.total) return '';
+    let out = '';
+    try {
+        const page = await _docPdf.getPage(n);
+        const tc = await page.getTextContent();
+        out = _docBuildPageText(tc.items);
+    } catch (e) { out = ''; }
+    _docTextCache[n] = out;
+    return out;
+}
+
+function _docCanvases() {
+    const c = document.getElementById('pdf-canvas-container');
+    return c ? Array.prototype.slice.call(c.querySelectorAll('canvas[data-page]')) : [];
+}
+
+/** The page nearest the top of the viewer: where "Read aloud" starts from. */
+function _docVisiblePage() {
+    const c = document.getElementById('pdf-canvas-container');
+    const cvs = _docCanvases();
+    if (!c || !cvs.length) return 1;
+    const top = c.getBoundingClientRect().top + 40;
+    for (let i = 0; i < cvs.length; i++) {
+        if (cvs[i].getBoundingClientRect().bottom > top) return parseInt(cvs[i].dataset.page, 10) || (i + 1);
+    }
+    return parseInt(cvs[cvs.length - 1].dataset.page, 10) || cvs.length;
+}
+
+function _docReaderFocusPage(n) {
+    const c = document.getElementById('pdf-canvas-container');
+    const cvs = _docCanvases();
+    cvs.forEach(cv => { cv.style.outline = ''; });
+    const t = cvs.find(cv => parseInt(cv.dataset.page, 10) === n);
+    if (!t || !c) return;
+    if (_docReader.active) t.style.outline = '3px solid #72efdd';
+    const y = t.getBoundingClientRect().top - c.getBoundingClientRect().top + c.scrollTop - 10;
+    try { c.scrollTo({ top: y, behavior: 'smooth' }); } catch (e) { c.scrollTop = y; }
+}
+
+function _docReaderSyncUi() {
+    const $ = id => document.getElementById(id);
+    const play = $('dr-play'), stop = $('dr-stop'), pg = $('dr-page'), spd = $('dr-speed'), st = $('dr-status');
+    const rate = $('dr-rate'), rl = $('dr-rate-label');
+    const r = _docReader;
+    const reading = r.active && !ttsPaused;
+    if (play) { play.textContent = reading ? '⏸' : '▶'; play.setAttribute('aria-label', reading ? 'Pause reading' : (ttsPaused ? 'Resume reading' : 'Read aloud')); }
+    if (stop) stop.disabled = !r.active;
+    if (pg) pg.textContent = 'Page ' + (r.active ? r.page : _docVisiblePage()) + ' / ' + r.total;
+    const rateTxt = ttsRate.toFixed(2).replace(/0$/, '').replace(/\.0$/, '') + '×';
+    if (spd) spd.textContent = rateTxt;
+    if (rl) rl.textContent = rateTxt;
+    if (rate) rate.value = ttsRate;
+    if (st) st.textContent = !r.active ? '🎧 Read aloud' : (r.busy ? '⏳ Preparing...' : (ttsPaused ? '⏸ Paused' : '🔊 Reading...'));
+}
+
+function _docFillVoices() {
+    const sel = document.getElementById('dr-voice');
+    if (!sel) return;
+    _loadVoices();
+    sel.innerHTML = '';
+    const auto = document.createElement('option');
+    auto.value = ''; auto.textContent = 'Automatic (best English voice)';
+    sel.appendChild(auto);
+    const norm = v => String(v.lang || '').replace('_', '-');
+    const english = ttsVoices.filter(v => /^en/i.test(norm(v)));
+    (english.length ? english : ttsVoices).forEach(v => {
+        const o = document.createElement('option');
+        o.value = v.voiceURI; o.textContent = v.name + ' (' + norm(v) + ')';
+        sel.appendChild(o);
+    });
+    sel.value = ttsVoiceURI && Array.prototype.some.call(sel.options, o => o.value === ttsVoiceURI) ? ttsVoiceURI : '';
+}
+
+/** Called once the PDF is loaded: reset reader state and show the bar. */
+function _docReaderInit(numPages) {
+    Object.keys(_docTextCache).forEach(k => delete _docTextCache[k]);
+    Object.assign(_docReader, { active: false, busy: false, internal: false, page: 1, total: numPages });
+    _docReader.token++;
+    const bar = document.getElementById('doc-reader-bar');
+    if (bar) bar.style.display = ttsSupported ? 'block' : 'none';
+    const c = document.getElementById('pdf-canvas-container');
+    if (c && !_docScrollBound) {
+        _docScrollBound = true;
+        let raf = 0;
+        c.addEventListener('scroll', function () {
+            if (_docReader.active || raf) return;
+            raf = requestAnimationFrame(function () { raf = 0; _docReaderSyncUi(); });
+        }, { passive: true });
+    }
+    _docReaderSyncUi();
+}
+
+/** Reset everything doc-related when a viewer opens or closes. */
+function _docResetUi() {
+    if (_docAbort) { try { _docAbort.abort(); } catch (e) {} _docAbort = null; }
+    _docProgressStop();
+    if (_docReader.active) docReaderStop();
+    _docReader.token++;
+    _docReader.total = 0;
+    ttsOnFinish = null;
+    const bar = document.getElementById('doc-reader-bar');
+    if (bar) bar.style.display = 'none';
+    const set = document.getElementById('doc-reader-settings');
+    if (set) set.style.display = 'none';
+    if (_docPdf) { try { _docPdf.destroy(); } catch (e) {} _docPdf = null; }
+}
+
+/** Engine callback (see stopReading): something else stopped the speech, so the document reader is no longer "reading". */
+function _docReaderOnStop() {
+    if (_docReader.internal || !_docReader.active) return;
+    _docReader.token++;
+    _docReader.active = false;
+    _docReader.busy = false;
+    _docCanvases().forEach(cv => { cv.style.outline = ''; });
+    _docReaderSyncUi();
+}
+
+async function _docReaderPlayFrom(startPage) {
+    if (!_docPdf) return;
+    const token = ++_docReader.token;
+    _docReader.active = true;
+    _docReader.busy = true;
+    _docReader.page = startPage;
+    _docReaderSyncUi();
+
+    // Find the first page from here that actually has text (scanned pages have none)
+    let p = startPage, text = '';
+    while (p <= _docReader.total) {
+        text = await _docPageText(p);
+        if (token !== _docReader.token) return;      // stopped / jumped while extracting
+        if (text) break;
+        p++;
+    }
+    _docReader.busy = false;
+    if (!text) {
+        showAppNotification("🔇 No readable text found. This PDF looks like scanned images.", "warning", 3500);
+        _docReader.active = false;
+        _docReaderSyncUi();
+        return;
+    }
+
+    _docReader.page = p;
+    _docReaderFocusPage(p);
+    _docReaderSyncUi();
+
+    _docReader.internal = true;                       // readText() calls stopReading() first: don't treat that as a user stop
+    try { readText('Page ' + p + '. ' + text, { force: true }); }
+    finally { _docReader.internal = false; }
+
+    // Move on to the next page when this one finishes
+    ttsOnFinish = function () {
+        if (token !== _docReader.token) return;
+        if (p < _docReader.total) {
+            _docReaderPlayFrom(p + 1);
+        } else {
+            _docReader.active = false;
+            _docCanvases().forEach(cv => { cv.style.outline = ''; });
+            _docReaderSyncUi();
+            showAppNotification("✅ Finished reading the document.", "info", 2500);
+        }
     };
+    _docPageText(p + 1);                              // prefetch the next page's text so there is no gap
+}
 
-    // Fire-and-forget analytics
+function docReaderToggle() {
+    if (!ttsSupported) {
+        showAppNotification("🔇 This browser can't read aloud. Try Chrome or Safari.", "warning", 3500);
+        return;
+    }
+    if (!_docPdf) return;
+    if (!_docReader.active) {
+        // Speak a silent utterance inside the tap: unlocks audio on iPhones before the async text extraction
+        try { const u = new SpeechSynthesisUtterance(' '); u.volume = 0; window.speechSynthesis.speak(u); } catch (e) {}
+        _docReaderPlayFrom(_docVisiblePage());
+        logAnalyticsEvent('doc_tts_start', 'Document voice reader');
+        return;
+    }
+    if (_docReader.busy) return;
+    if (ttsPaused || ttsSpeaking) { toggleReadPause(); _docReaderSyncUi(); }
+}
+
+function docReaderStop() {
+    if (!_docReader.active) return;
+    stopReading();            // engine calls _docReaderOnStop → resets the reader state and UI
+}
+
+function docReaderStep(delta) {
+    if (!_docPdf) return;
+    const cur = _docReader.active ? _docReader.page : _docVisiblePage();
+    const t = Math.min(_docReader.total, Math.max(1, cur + delta));
+    if (_docReader.active) { _docReaderPlayFrom(t); }     // jump the reading to that page
+    else { _docReaderFocusPage(t); setTimeout(_docReaderSyncUi, 350); }
+}
+
+function docReaderCycleSpeed() {
+    let next = _DOC_RATES.find(r => r > ttsRate + 0.01);
+    if (next === undefined) next = _DOC_RATES[0];
+    setTtsRate(next);
+    _docReaderSyncUi();
+}
+
+function docReaderToggleSettings() {
+    const set = document.getElementById('doc-reader-settings');
+    if (!set) return;
+    const open = set.style.display === 'none';
+    set.style.display = open ? 'block' : 'none';
+    if (open) { _docFillVoices(); _docReaderSyncUi(); }
+}
+
+// ── Non-PDF fallback (video, PPTX, Word): Drive preview iframe. Needs internet; not cached. ──
+function loadNonPdfPreview(fileId, title) {
+    const container = document.getElementById('pdf-canvas-container');
+    const loader = document.getElementById('doc-loader-overlay');
+    if (!container) return;
+    container.innerHTML = `<iframe src="https://drive.google.com/file/d/${fileId}/preview" style="width:100%; height:100%; min-height:100%; border:none; background:white;" allow="autoplay; fullscreen" allowfullscreen></iframe>`;
+    if (loader) loader.style.display = 'none';
     logAnalyticsEvent('document_view', `Viewed: ${title}`);
 }
 
@@ -993,16 +1523,17 @@ function openDocumentViewer(fileId, title) {
         showAppNotification("⚠️ Document link unavailable", "error");
         return;
     }
-    showDocViewerLoading(title);
-    loadDocInViewer(fileId, title);
+    attemptOpenDoc(fileId, title);
 }
 
 function closeDocViewer() {
     const viewer = document.getElementById('smart-doc-viewer');
     if (viewer) {
         viewer.style.display = 'none';
-        const iframe = document.getElementById('doc-frame');
-        if (iframe) iframe.src = "";
+        _docRenderId++;   // stop any in-flight PDF render
+        _docResetUi();    // cancel a running download, stop the progress bar and the voice reader
+        const container = document.getElementById('pdf-canvas-container');
+        if (container) container.innerHTML = "";
         document.body.style.overflow = 'auto';
     }
 }
@@ -1011,9 +1542,10 @@ function closeDocViewer() {
 // === NEW: Document Access Control & Quiz Starter Helpers ===
 // ============================================================
 
-// Document access bouncer — shows skeleton INSTANTLY, verifies in background,
-// then loads the iframe. Fixes the "frozen tap" UX delay.
-async function attemptOpenDoc(fileId, title) {
+// Document access bouncer — shows skeleton INSTANTLY, verifies, then renders.
+// PDFs are downloaded through the Gatekeeper, cached in IndexedDB, and drawn by PDF.js.
+// A cached file is NEVER read before the access check passes (online: server, offline: local expiry).
+async function attemptOpenDoc(fileId, title, mimeType) {
     if (!hasFullAccess) {
         // Free user: show message and payment modal
         showAppNotification("⚠️ Documents are only accessible in Full Access mode.", "warning", 2500);
@@ -1023,40 +1555,102 @@ async function attemptOpenDoc(fileId, title) {
         return;
     }
 
+    const isPdf = !mimeType || String(mimeType).toLowerCase().includes('pdf');
+    const sessionPayload = { code: userCode, email: userEmail };
+    const loaderText = () => document.getElementById('doc-loader-text');
+
     // ── 1. INSTANT FEEDBACK: show the viewer + shimmer right now ──
     showDocViewerLoading(title);
 
-    // ── 2. Verify with Gatekeeper in the background ──
-    try {
-        const res = await fetch(APPS_SCRIPT_URL, {
-            method: 'POST',
-            headers: { "Content-Type": "text/plain;charset=utf-8" },
-            body: JSON.stringify({
-                action: 'verify_document_access',
-                file_id: fileId,
-                session: { 
-                    code: userCode, 
-                    email: userEmail 
-                }
-            })
-        });
-        
-        const data = await res.json();
-        
-        if (data.success) {
-            // ── 3. Verified: load the actual document ──
-            loadDocInViewer(fileId, title);
-        } else {
-            // Denied: close the viewer and tell the student why
+    // ── 2. OFFLINE: local expiry check (the "bouncer"), then the IndexedDB cache ──
+    if (!navigator.onLine) {
+        const expiry = parseInt(localStorage.getItem(`expiry_${currentTermKey}`), 10);
+        if (!expiry || Date.now() >= expiry) {
             closeDocViewer();
-            showAppNotification("❌ Access Denied: " + (data.message || "Unknown error"), "error");
-            if (data.code === 'SESSION_INVALID') {
-                handleSessionExpired(data.message);
+            showAppNotification("⏳ Session expired. Connect to internet to verify.", "warning");
+            return;
+        }
+        if (!isPdf) {
+            closeDocViewer();
+            showAppNotification("📡 You are offline. This file type needs an internet connection.", "warning");
+            return;
+        }
+        const offlineCopy = await getOfflineDoc(fileId);
+        if (offlineCopy) {
+            if (loaderText()) loaderText().textContent = 'Loading from offline cache...';
+            renderPdfFromBase64(offlineCopy, title);
+        } else {
+            closeDocViewer();
+            showAppNotification("📡 You are offline and haven't viewed this document before.", "warning");
+        }
+        return;
+    }
+
+    try {
+        // ── 3. ONLINE, non-PDF (video / PPTX / Word): verify, then Drive preview iframe (not cached) ──
+        if (!isPdf) {
+            const vres = await fetch(APPS_SCRIPT_URL, {
+                method: 'POST',
+                headers: { "Content-Type": "text/plain;charset=utf-8" },
+                body: JSON.stringify({ action: 'verify_document_access', file_id: fileId, session: sessionPayload })
+            });
+            const vdata = await vres.json();
+            if (vdata.success) {
+                showAppNotification("📄 Previewing Office/Video files requires an internet connection.", "info");
+                loadNonPdfPreview(fileId, title);
+            } else {
+                _denyDocAccess(vdata);
             }
+            return;
+        }
+
+        // ── 4. ONLINE, PDF: if cached, still verify with the server before reading the cache ──
+        const cachedBase64 = await getOfflineDoc(fileId);
+        if (cachedBase64) {
+            if (loaderText()) loaderText().textContent = 'Verifying access...';
+            const vres = await fetch(APPS_SCRIPT_URL, {
+                method: 'POST',
+                headers: { "Content-Type": "text/plain;charset=utf-8" },
+                body: JSON.stringify({ action: 'verify_document_access', file_id: fileId, session: sessionPayload })
+            });
+            const vdata = await vres.json();
+            if (!vdata.success) { _denyDocAccess(vdata); return; }
+            if (loaderText()) loaderText().textContent = 'Loading from offline cache...';
+            renderPdfFromBase64(cachedBase64, title);
+            return;
+        }
+
+        // ── 5. ONLINE, PDF, not cached: download via Gatekeeper (it verifies access itself) ──
+        if (loaderText()) loaderText().textContent = 'Downloading securely...';
+        _docAbort = new AbortController();
+        const _myAbort = _docAbort;
+        const data = await _fetchDocWithProgress(
+            JSON.stringify({ action: 'download_document', file_id: fileId, session: sessionPayload }),
+            _expectedDocBytes(fileId),
+            _myAbort.signal
+        );
+        if (_myAbort.signal.aborted) return;   // viewer was closed / another document opened meanwhile
+
+        if (data.success && data.data && data.data.base64) {
+            _docProgressFinish();
+            await saveDocOffline(fileId, data.data.base64);   // save for offline use
+            renderPdfFromBase64(data.data.base64, title);
+        } else {
+            _denyDocAccess(data);
         }
     } catch (e) {
+        if (e && e.name === 'AbortError') return;   // the student cancelled / closed the viewer
         closeDocViewer();
-        showAppNotification("⚠️ Connection error. Could not verify document access.", "error");
+        showAppNotification("⚠️ Connection error. Could not load the document.", "error");
+    }
+}
+
+// Denied / failed: close the viewer, tell the student why, log out if the session is dead
+function _denyDocAccess(data) {
+    closeDocViewer();
+    showAppNotification("❌ Access Denied: " + ((data && data.message) || "Unknown error"), "error");
+    if (data && data.code === 'SESSION_INVALID') {
+        handleSessionExpired(data.message);
     }
 }
 
@@ -1113,6 +1707,19 @@ function startCustomShortAnswer() {
 // ============================================================
 // === MODIFIED: Document Renderer (RESTORED FROM BASE A) ===
 // ============================================================
+
+/** Short, student-friendly label for a document's MIME type (never prints the raw string). */
+function docTypeLabel(mime) {
+    const t = String(mime || '').toLowerCase();
+    if (t.indexOf('pdf') !== -1) return { label: 'PDF', icon: '📕' };
+    if (t.indexOf('presentation') !== -1 || t.indexOf('powerpoint') !== -1 || t.indexOf('slides') !== -1) return { label: 'SLIDES', icon: '📊' };
+    // Spreadsheets BEFORE Word: "officedocument.spreadsheetml" also contains the word "document".
+    if (t.indexOf('spreadsheet') !== -1 || t.indexOf('excel') !== -1 || t.indexOf('sheet') !== -1) return { label: 'EXCEL', icon: '📗' };
+    if (t.indexOf('word') !== -1 || t.indexOf('msword') !== -1 || t.indexOf('document') !== -1) return { label: 'DOC', icon: '📘' };
+    if (t.indexOf('video') !== -1 || t.indexOf('mp4') !== -1) return { label: 'VIDEO', icon: '🎥' };
+    if (t.indexOf('image') !== -1 || t.indexOf('jpg') !== -1 || t.indexOf('jpeg') !== -1 || t.indexOf('png') !== -1) return { label: 'IMAGE', icon: '🖼️' };
+    return { label: 'FILE', icon: '📄' };
+}
 
 async function renderDocuments() {
     // IMPORTANT: Uses DOCS_SCRIPT_URL (Gatekeeper) to fetch data
@@ -1177,20 +1784,17 @@ async function renderDocuments() {
         documents.forEach(doc => {
     const shortDesc = doc.description ? (doc.description.length > 80 ? doc.description.substring(0, 80) + '...' : doc.description) : '';
     
-    // ── Determine fallback icon based on file type ──
-    let fallbackIcon = '📄';
-    const fileType = (doc.type || '').toLowerCase();
-    if (fileType.includes('pdf')) fallbackIcon = '📕';
-    else if (fileType.includes('image') || fileType.includes('jpg') || fileType.includes('png')) fallbackIcon = '🖼️';
-    else if (fileType.includes('word') || fileType.includes('doc')) fallbackIcon = '📘';
-    else if (fileType.includes('excel') || fileType.includes('sheet')) fallbackIcon = '📊';
+    // ── Clean label + fallback icon from the file's MIME type ──
+    const _dt = docTypeLabel(doc.type);
+    const displayType = _dt.label;
+    const fallbackIcon = _dt.icon;
     
     const lockIcon = hasFullAccess ? "👁️ Open" : "🔒 Locked";
     const lockColor = hasFullAccess ? "#28a745" : "#dc3545";
     const cardOpacity = hasFullAccess ? "1" : "0.75";
     
     html += `
-    <div class="doc-card" onclick="attemptOpenDoc('${doc.fileId}', '${doc.title.replace(/'/g, "\\'")}')" 
+    <div class="doc-card" onclick="attemptOpenDoc('${doc.fileId}', '${doc.title.replace(/'/g, "\\'")}', '${String(doc.type || '').replace(/'/g, "\\'")}')" 
          style="background:#2b3a55; padding:15px; border-radius:10px; border-left:5px solid ${lockColor}; 
                 cursor:pointer; transition:0.3s; box-shadow: 0 4px 8px rgba(0,0,0,0.2); opacity: ${cardOpacity};">
 
@@ -1202,7 +1806,7 @@ async function renderDocuments() {
                  style="width:100%; height:100%; object-fit:cover; transition:0.3s;"
                  onerror="this.style.display='none'; this.parentElement.innerHTML='<span style=\\'font-size:48px; opacity:0.5; color:#a0a8b4;\\'>${fallbackIcon}</span>';">
             <div style="position:absolute; bottom:6px; right:8px; background:rgba(0,0,0,0.7); padding:2px 10px; border-radius:12px; font-size:9px; color:#fff; text-transform:uppercase; letter-spacing:0.5px;">
-                ${doc.type || 'FILE'}
+                ${displayType}
             </div>
         </div>
 
@@ -1210,7 +1814,7 @@ async function renderDocuments() {
         <div style="font-size:1.1em; font-weight:bold; color:white; margin-bottom:8px; line-height:1.3;">${doc.title}</div>
         <div style="font-size:0.85em; color:#a0a8b4; margin-bottom:10px;">${shortDesc}</div>
         <div style="display:flex; justify-content:space-between; align-items:center; margin-top:10px; border-top:1px solid #3e506e; padding-top:10px;">
-            <span style="background:#0d1b2a; padding:2px 8px; border-radius:4px; font-size:0.7em; color:#fff;">${doc.type || 'FILE'} • ${doc.size || 'Unknown'}</span>
+            <span style="background:#0d1b2a; padding:2px 8px; border-radius:4px; font-size:0.7em; color:#fff;">${displayType} • ${doc.size || 'Unknown'}</span>
             <span style="color:${lockColor}; font-size:0.9em; font-weight:bold;">${lockIcon}</span>
         </div>
     </div>`;
@@ -1408,6 +2012,9 @@ function handleSessionExpired(message) {
         clearInterval(revalidationInterval);
         revalidationInterval = null;
     }
+    // Halt any document currently on screen and delete all offline copies
+    closeDocViewer();
+    clearOfflineDocs();
     enableDemoUI();
     showAppNotification(`⏳ ${message || 'Session expired. Please log in again.'}`, 'warning');
 }
@@ -6046,6 +6653,7 @@ let ttsCurrentChunk = '';
 let ttsSpeaking = false;
 let ttsPaused = false;
 let ttsLastText = '';
+let ttsOnFinish = null;      // one-shot callback: fires when the queue empties naturally (used by the document reader)
 let utterance = null;
 
 function _loadVoices() {
@@ -6113,7 +6721,9 @@ function _speakNext(session) {
     if (session !== ttsSession) return;
     if (!ttsQueue.length) {
         ttsSpeaking = false; ttsCurrentChunk = ''; utterance = null;
+        const _fin = ttsOnFinish; ttsOnFinish = null;
         _syncStripTts();
+        if (typeof _fin === 'function') { try { _fin(); } catch (e) {} }
         return;
     }
 
@@ -6207,8 +6817,10 @@ function stopReading() {
     ttsSpeaking = false;
     ttsPaused = false;
     utterance = null;
+    ttsOnFinish = null;
     if (ttsSupported) { try { window.speechSynthesis.cancel(); } catch (e) {} }
     _syncStripTts();
+    if (typeof _docReaderOnStop === 'function') _docReaderOnStop();
 }
 
 /** Speak text. opts.force = speak even if the reader is switched off (explicit Replay / Test taps). */
@@ -7429,4 +8041,4 @@ function _brandLogoImg(px, radius) {
     // Retry on window load in case the stylesheet resolved after this
     // script parsed. Cheap insurance, runs once.
     window.addEventListener('load', applyFavicon);
-})(); 
+})(); ; 
