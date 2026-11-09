@@ -955,6 +955,8 @@ function injectDocViewerHTML() {
                 #doc-reader-bar .dr-primary { background:#72efdd; color:#0d1b2a; border-color:#72efdd; font-weight:bold; min-width:46px; }
                 #doc-reader-bar .dr-page { color:#e0e6ed; font-size:.85em; min-width:84px; text-align:center; }
                 #doc-reader-bar .dr-status { color:#72efdd; font-size:.8em; }
+                #doc-reader-bar .dr-chip { border:1px solid #3e506e; background:#1a1a2e; color:#72efdd; border-radius:14px; padding:4px 12px; font-size:.75em; cursor:pointer; }
+                #doc-reader-bar .dr-chip.off { color:#a0a8b4; }
                 #doc-reader-bar .dr-set label { display:block; color:#a0a8b4; font-size:.8em; margin:8px 0 4px; }
                 #doc-reader-bar .dr-set select { width:100%; padding:9px; border-radius:8px; background:#1a1a2e; color:#fff; border:1px solid #3e506e; }
                 #doc-reader-bar .dr-set input[type=range] { width:100%; }
@@ -967,6 +969,10 @@ function injectDocViewerHTML() {
                     <label for="dr-rate">Speed: <span id="dr-rate-label">1×</span></label>
                     <input type="range" id="dr-rate" min="0.5" max="2" step="0.25" value="1" oninput="setTtsRate(this.value); _docReaderSyncUi();">
                     <div style="color:#7d8797; font-size:.72em; margin-top:6px;">Voice and speed changes apply from the next sentence.</div>
+                    <div id="dr-furn-list"></div>
+                </div>
+                <div id="dr-furn-row" style="display:none; text-align:center; padding:6px 10px 0;">
+                    <button id="dr-furn" class="dr-chip" onclick="docReaderToggleFurniture()"></button>
                 </div>
                 <div class="dr-row">
                     <button id="dr-play" class="dr-btn dr-primary" onclick="docReaderToggle()" aria-label="Read aloud">▶</button>
@@ -1254,57 +1260,182 @@ const _docReader = { active: false, busy: false, internal: false, token: 0, page
 const _DOC_RATES = [0.75, 1, 1.25, 1.5, 1.75, 2];
 let _docScrollBound = false;
 
-/** Turn PDF.js text items into clean, speakable text: rebuild lines, join wrapped lines, de-hyphenate, drop page numbers. */
-function _docBuildPageText(items) {
+// ---------- Page furniture: headers/footers that repeat on every page (copyright lines, page numbers...) ----------
+// Learned per document from RECURRENCE (same text, same vertical band, on most pages), so it works for any
+// publisher. Position alone never removes text; a keyword (©, "all rights reserved") is needed without recurrence.
+const _docFurn = { on: true, learning: false, keys: new Set(), list: [], ready: Promise.resolve() };
+try { _docFurn.on = localStorage.getItem('kaeri_doc_skip_furniture') !== '0'; } catch (e) {}
+let _docOpenFileId = '';
+const _DOC_FURN_KEYWORDS = /(©|\(c\)\s*\d{4}|all\s+rights\s+reserved|may\s+not\s+be\s+(scanned|copied|duplicated|posted))/i;
+
+function _docCleanText(t) {
+    return String(t).replace(/[­]/g, '')
+        .replace(/ﬁ/g, 'fi').replace(/ﬂ/g, 'fl').replace(/ﬀ/g, 'ff')
+        .replace(/ﬃ/g, 'ffi').replace(/ﬄ/g, 'ffl')
+        .replace(/\s+/g, ' ').trim();
+}
+
+/** Same text (digits/case/spacing ignored) in the same 5% vertical band = same piece of furniture. */
+function _docFurnKey(text, band) {
+    return text.toLowerCase().replace(/\s+/g, '').replace(/\d+/g, '#') + '|' + band;
+}
+
+/** Group raw PDF.js items into visual lines with position (top = 0 at the page top, 1 at the bottom) and font size. */
+function _docGroupLines(items, view) {
+    const fsOf = it => Math.abs(it.height) || Math.abs((it.transform || [])[3]) || Math.abs((it.transform || [])[0]) || 10;
+    const y0 = view ? view[1] : 0;
+    const H = view ? ((view[3] - view[1]) || 1) : 0;
     const lines = [];
-    let cur = '', prev = null;
-    function flush() { if (cur.trim()) lines.push(cur); cur = ''; prev = null; }
+    const seen = new Set();                 // overprinted duplicates: identical text drawn twice at the same spot
+    let cur = null, prev = null;
+    function flush() {
+        if (cur && cur.t.trim()) {
+            cur.top = H ? 1 - (cur.y - y0) / H : 0.5;
+            cur.band = Math.max(0, Math.min(19, Math.floor(cur.top * 20)));
+            lines.push(cur);
+        }
+        cur = null; prev = null;
+    }
     for (let i = 0; i < items.length; i++) {
         const it = items[i];
         const str = it.str || '';
         const tr = it.transform || [1, 0, 0, 1, 0, 0];
-        if (prev && Math.abs(tr[5] - prev.tr[5]) > 2) flush();   // new baseline = new line
-        if (str) {
-            if (prev) {
+        const fs = fsOf(it);
+        if (str.trim()) {
+            // Overprint: the same text drawn twice at (almost) the same spot. Compare cleaned text ("ﬁ" == "fi")
+            // and look in the neighbouring 1pt cells, so a 0.2pt nudge between the two layers can't split a pair.
+            const ct = _docCleanText(str), rx = Math.round(tr[4]), ry = Math.round(tr[5]);
+            let dup = false;
+            for (let dx = -1; dx <= 1 && !dup; dx++)
+                for (let dy = -1; dy <= 1 && !dup; dy++)
+                    if (seen.has(ct + '|' + (rx + dx) + '|' + (ry + dy))) dup = true;
+            if (dup) continue;
+            seen.add(ct + '|' + rx + '|' + ry);
+            if (prev && Math.abs(tr[5] - prev.tr[5]) > Math.max(2, fs * 0.45)) flush();   // new baseline = new line (small shifts are super/subscripts)
+            if (!cur) cur = { t: '', x: tr[4], y: tr[5], fs: fs, top: 0.5, band: 10 };
+            else if (prev) {
                 const gap = tr[4] - (prev.tr[4] + (prev.w || 0));
-                const fs = Math.abs(tr[0]) || 10;
-                if (gap > fs * 0.2 && !/\s$/.test(cur) && !/^\s/.test(str)) cur += ' ';
+                const avg = (it.width || 0) / Math.max(1, str.length);                  // average glyph width: scales with condensed text
+                if (gap > Math.max(0.3 * (avg || fs * 0.5), 0.5) && !/\s$/.test(cur.t) && !/^\s/.test(str)) cur.t += ' ';
             }
-            cur += str;
+            cur.t += str;
             prev = { tr: tr, w: it.width || 0 };
         }
         if (it.hasEOL) flush();
     }
     flush();
 
-    const L = lines
-        .map(l => l.replace(/[­]/g, '')
-                   .replace(/ﬁ/g, 'fi').replace(/ﬂ/g, 'fl').replace(/ﬀ/g, 'ff')
-                   .replace(/ﬃ/g, 'ffi').replace(/ﬄ/g, 'ffl')
-                   .replace(/^[•●▪■◦○·-]\s*/, '')
-                   .replace(/\s+/g, ' ').trim())
-        .filter(l => l && !/^(page\s*)?\d{1,3}(\s*(of|\/)\s*\d{1,3})?$/i.test(l));   // lone page numbers
+    // Dominant body font size (by characters), ignoring the top/bottom margins
+    const hist = {};
+    const inBody = l => !H || (l.top > 0.12 && l.top < 0.88);
+    lines.forEach(l => { if (inBody(l)) { const k = Math.round(l.fs); hist[k] = (hist[k] || 0) + l.t.length; } });
+    if (!Object.keys(hist).length) lines.forEach(l => { const k = Math.round(l.fs); hist[k] = (hist[k] || 0) + l.t.length; });
+    let bodyFs = 12, best = 0;
+    Object.keys(hist).forEach(k => { if (hist[k] > best) { best = hist[k]; bodyFs = +k; } });
+    return { lines: lines, bodyFs: bodyFs };
+}
 
+function _docIsFurniture(text, line, bodyFs, furn) {
+    for (let d = -1; d <= 1; d++) if (furn.keys.has(_docFurnKey(text, line.band + d))) return true;    // learned: recurs on most pages
+    return line.fs <= 0.75 * bodyFs && _DOC_FURN_KEYWORDS.test(text);                                    // small print with copyright wording
+}
+
+/**
+ * Turn PDF.js text items into clean, speakable text.
+ * - Repeating headers/footers (page furniture) are dropped.
+ * - Lines that merely WRAP (same font size, normal line spacing, previous line not ended by punctuation)
+ *   are joined with a space, so a sentence is spoken in one go with no pause at the right-hand edge.
+ * - A real break (bullet, heading, paragraph gap, sentence end) becomes a pause.
+ */
+function _docBuildPageText(items, view, furn) {
+    const BULLET = /^[•●▪■◦○·–—-]\s*/;
+    const g = _docGroupLines(items, view);
+
+    // Clean each line; drop furniture; note whether it starts with a bullet marker
+    const L = [];
+    g.lines.forEach(l => {
+        let t = _docCleanText(l.t);
+        const edge = l.top <= 0.12 || l.top >= 0.88;
+        if (furn && edge && t && _docIsFurniture(t, l, g.bodyFs, furn)) return;
+        const bullet = BULLET.test(t);
+        t = t.replace(BULLET, '').trim();
+        if (!t || /^(page\s*)?\d{1,3}(\s*(of|\/)\s*\d{1,3})?$/i.test(t)) return;        // empty / lone page numbers
+        L.push({ t: t, x: l.x, y: l.y, fs: l.fs, bullet: bullet });
+    });
+
+    // Join wrapped lines; keep real breaks as pauses
     let text = '';
     for (let i = 0; i < L.length; i++) {
-        if (!text) { text = L[i]; continue; }
-        const before = L[i - 1];
-        if (/[A-Za-z]-$/.test(before) && /^[a-z]/.test(L[i])) text = text.slice(0, -1) + L[i];      // de-hyphenate
-        else if (/[.!?:;]$/.test(before) || before.length < 45) text += '\n' + L[i];                 // heading / bullet / sentence end
-        else text += ' ' + L[i];                                                                      // wrapped mid-sentence
+        if (i === 0) { text = L[0].t; continue; }
+        const P = L[i - 1], C = L[i];
+        const gap = P.y - C.y;                                                  // distance down the page
+        const sameSize = Math.abs(C.fs - P.fs) <= Math.max(1, 0.15 * P.fs);
+        const close = gap > 0 && gap <= 1.6 * Math.max(C.fs, P.fs);             // normal line spacing, not a paragraph/bullet gap
+        const ended = /[.!?:;]$/.test(P.t);
+        if (/[A-Za-z]-$/.test(P.t) && /^[a-z]/.test(C.t) && sameSize && close) text = text.slice(0, -1) + C.t;   // de-hyphenate
+        else if (!ended && !C.bullet && sameSize && close) text += ' ' + C.t;                                      // wrapped line: same sentence
+        else text += '\n' + C.t;                                                                                    // real break: pause
     }
     return text.trim();
+}
+
+/** Learn this document's furniture from a sample of pages (or load it from the offline cache). */
+async function _docLearnFurniture(pdf, total, fileId) {
+    const F = { keys: new Set(), list: [] };
+    try {
+        if (fileId) {
+            const c = await getOfflineDoc('furn:' + fileId);
+            if (c && c.v === 1 && c.pages === total && Array.isArray(c.keys)) {
+                c.keys.forEach(k => F.keys.add(k));
+                F.list = c.list || [];
+                return F;
+            }
+        }
+        const idx = [];
+        if (total <= 8) { for (let n = 1; n <= total; n++) idx.push(n); }
+        else { for (let i = 0; i < 8; i++) idx.push(1 + Math.round(i * (total - 1) / 7)); }   // 8 pages spread across the document
+
+        const counts = new Map(), example = new Map();
+        const groups = await Promise.all(idx.map(async n => {
+            const page = await pdf.getPage(n);
+            const tc = await page.getTextContent();
+            return _docGroupLines(tc.items, page.view);
+        }));
+        for (let i = 0; i < groups.length; i++) {
+            const g = groups[i];
+            const seenOnPage = new Set();
+            g.lines.forEach(l => {
+                const t = _docCleanText(l.t);
+                if ((t.match(/[A-Za-z]/g) || []).length < 8) return;                 // needs real words (never lone bullets/numbers)
+                if (!(l.top <= 0.12 || l.top >= 0.88)) return;                        // only the top/bottom margins
+                if (l.fs > 0.75 * g.bodyFs) return;                                   // small print only: slide titles AND running headers set in body-size type are always kept
+                const k = _docFurnKey(t, l.band);
+                if (seenOnPage.has(k)) return;
+                seenOnPage.add(k);
+                counts.set(k, (counts.get(k) || 0) + 1);
+                if (!example.has(k)) example.set(k, t.replace(/\s*\d{1,3}$/, ''));
+            });
+        }
+        const need = Math.max(3, Math.ceil(0.4 * idx.length));                       // on 40%+ of the sampled pages
+        counts.forEach((c, k) => { if (c >= need) { F.keys.add(k); F.list.push(example.get(k)); } });
+        if (fileId) saveDocOffline('furn:' + fileId, { v: 1, pages: total, keys: Array.from(F.keys), list: F.list });
+    } catch (e) { /* learning is best-effort: on failure nothing is skipped */ }
+    return F;
 }
 
 async function _docPageText(n) {
     if (_docTextCache[n] !== undefined) return _docTextCache[n];
     if (!_docPdf || n < 1 || n > _docReader.total) return '';
+    const pdf = _docPdf;
+    try { await _docFurn.ready; } catch (e) {}          // furniture is learned before any page is read
+    if (pdf !== _docPdf) return '';
     let out = '';
     try {
-        const page = await _docPdf.getPage(n);
+        const page = await pdf.getPage(n);
         const tc = await page.getTextContent();
-        out = _docBuildPageText(tc.items);
+        out = _docBuildPageText(tc.items, page.view, _docFurn.on ? _docFurn : null);
     } catch (e) { out = ''; }
+    if (pdf !== _docPdf) return '';
     _docTextCache[n] = out;
     return out;
 }
@@ -1375,6 +1506,17 @@ function _docFillVoices() {
 function _docReaderInit(numPages) {
     Object.keys(_docTextCache).forEach(k => delete _docTextCache[k]);
     Object.assign(_docReader, { active: false, busy: false, internal: false, page: 1, total: numPages });
+    // Learn the document's repeating headers/footers in the background (finished before the first page is read)
+    _docFurn.keys = new Set(); _docFurn.list = [];
+    const _pdfNow = _docPdf, _idNow = _docOpenFileId;
+    _docFurn.learning = true;
+    _docFurnSyncUi();
+    _docFurn.ready = _docLearnFurniture(_pdfNow, numPages, _idNow).then(F => {
+        if (_pdfNow !== _docPdf) return;
+        _docFurn.keys = F.keys; _docFurn.list = F.list;
+        _docFurn.learning = false;
+        _docFurnSyncUi();
+    });
     _docReader.token++;
     const bar = document.getElementById('doc-reader-bar');
     if (bar) bar.style.display = ttsSupported ? 'block' : 'none';
@@ -1400,6 +1542,8 @@ function _docResetUi() {
     ttsOnFinish = null;
     const bar = document.getElementById('doc-reader-bar');
     if (bar) bar.style.display = 'none';
+    _docFurn.keys = new Set(); _docFurn.list = []; _docFurn.learning = false; _docFurn.ready = Promise.resolve();
+    _docFurnSyncUi();
     const set = document.getElementById('doc-reader-settings');
     if (set) set.style.display = 'none';
     if (_docPdf) { try { _docPdf.destroy(); } catch (e) {} _docPdf = null; }
@@ -1499,6 +1643,45 @@ function docReaderCycleSpeed() {
     _docReaderSyncUi();
 }
 
+/** Show "🧹 Skipping headers & footers (n)" when furniture was found; the settings panel lists what is skipped. */
+function _docFurnSyncUi() {
+    const row = document.getElementById('dr-furn-row');
+    const btn = document.getElementById('dr-furn');
+    const list = document.getElementById('dr-furn-list');
+    const n = _docFurn.list.length;
+    if (row) row.style.display = (n || _docFurn.learning) ? 'block' : 'none';
+    if (btn) {
+        btn.textContent = _docFurn.learning ? '🧹 Learning headers & footers…'
+                        : _docFurn.on ? '🧹 Skipping headers & footers (' + n + ')'
+                        : '📄 Reading headers & footers (skip: off)';
+        btn.classList.toggle('off', !_docFurn.on && !_docFurn.learning);
+    }
+    if (list) {
+        list.innerHTML = '';
+        if (n) {
+            const h = document.createElement('div');
+            h.style.cssText = 'color:#a0a8b4;font-size:.75em;margin-top:8px;';
+            h.textContent = 'Repeated on every page:';
+            list.appendChild(h);
+            _docFurn.list.forEach(t => {
+                const d = document.createElement('div');
+                d.style.cssText = 'color:#7d8797;font-size:.7em;margin-top:3px;';
+                d.textContent = t.length > 90 ? t.slice(0, 90) + '…' : t;
+                list.appendChild(d);
+            });
+        }
+    }
+}
+
+function docReaderToggleFurniture() {
+    _docFurn.on = !_docFurn.on;
+    try { localStorage.setItem('kaeri_doc_skip_furniture', _docFurn.on ? '1' : '0'); } catch (e) {}
+    Object.keys(_docTextCache).forEach(k => delete _docTextCache[k]);   // re-extract pages with the new setting
+    _docFurnSyncUi();
+    showAppNotification(_docFurn.on ? "🧹 Skipping repeated headers & footers." : "📄 Reading everything, including headers & footers.", "info", 2200);
+    if (_docReader.active) _docReaderPlayFrom(_docReader.page);
+}
+
 function docReaderToggleSettings() {
     const set = document.getElementById('doc-reader-settings');
     if (!set) return;
@@ -1556,6 +1739,7 @@ async function attemptOpenDoc(fileId, title, mimeType) {
     }
 
     const isPdf = !mimeType || String(mimeType).toLowerCase().includes('pdf');
+    _docOpenFileId = fileId;
     const sessionPayload = { code: userCode, email: userEmail };
     const loaderText = () => document.getElementById('doc-loader-text');
 
