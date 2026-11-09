@@ -1035,28 +1035,95 @@ function getDb() {
     });
 }
 
-async function getOfflineDoc(fileId) {
+let _lastOfflineError = null;      // why the last save failed (e.g. QuotaExceededError), for the student-facing message
+
+/** Read an offline entry. Returns an ArrayBuffer (new format), a Base64 string (older saves) or null. */
+async function getOfflineDoc(key) {
+    let db = null;
     try {
-        const db = await getDb();
+        db = await getDb();
         return await new Promise((resolve) => {
-            const req = db.transaction(STORE_NAME, 'readonly').objectStore(STORE_NAME).get(fileId);
+            const req = db.transaction(STORE_NAME, 'readonly').objectStore(STORE_NAME).get(key);
             req.onsuccess = () => resolve(req.result || null);
             req.onerror = () => resolve(null);
         });
     } catch (e) { return null; }
+    finally { try { if (db) db.close(); } catch (e) {} }
 }
 
-async function saveDocOffline(fileId, base64Data) {
+/** Save an entry. Returns true only when the browser confirms the write; false (with _lastOfflineError set) otherwise. */
+async function saveDocOffline(key, value) {
+    let db = null;
     try {
-        const db = await getDb();
-        await new Promise((resolve) => {
-            const tx = db.transaction(STORE_NAME, 'readwrite');
-            tx.objectStore(STORE_NAME).put(base64Data, fileId);
+        db = await getDb();
+        return await new Promise((resolve) => {
+            let tx;
+            try {
+                tx = db.transaction(STORE_NAME, 'readwrite');
+                tx.objectStore(STORE_NAME).put(value, key);
+            } catch (e) { _lastOfflineError = e; resolve(false); return; }
             tx.oncomplete = () => resolve(true);
-            tx.onerror = () => resolve(false);   // e.g. storage full: viewing still works, just not cached
-            tx.onabort = () => resolve(false);
+            tx.onerror = () => { _lastOfflineError = tx.error; resolve(false); };
+            tx.onabort = () => { _lastOfflineError = tx.error; resolve(false); };
         });
-    } catch (e) { /* caching is best-effort */ }
+    } catch (e) { _lastOfflineError = e; return false; }
+    finally { try { if (db) db.close(); } catch (e) {} }
+}
+
+/** Base64 -> bytes. Documents are stored as raw bytes: about 25% smaller than the Base64 text. */
+function _b64ToBytes(b64) {
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return bytes;
+}
+
+/**
+ * Ask the browser to keep this site's offline files. Without this, Chrome treats them as "best effort"
+ * and can delete them when the phone runs low on space. Chrome grants it to bookmarked / installed sites.
+ */
+async function _ensurePersistentStorage() {
+    try {
+        if (!navigator.storage || !navigator.storage.persist) return false;
+        if (navigator.storage.persisted && await navigator.storage.persisted()) return true;
+        return !!(await navigator.storage.persist());
+    } catch (e) { return false; }
+}
+window.addEventListener('load', function () { _ensurePersistentStorage(); });   // re-asks on every visit: granted once the site is bookmarked/installed
+
+function _offlineTipOnce() {
+    try {
+        if (localStorage.getItem('kaeri_persist_tip')) return;
+        localStorage.setItem('kaeri_persist_tip', '1');
+    } catch (e) {}
+    showAppNotification("💡 Tip: bookmark this page or add it to your home screen so your phone keeps your offline documents.", "info", 7000);
+}
+
+/** Tell the student what happened after a download: saved, or why not. */
+async function _reportOfflineSave(saved) {
+    if (saved) {
+        const persisted = await _ensurePersistentStorage();
+        showAppNotification("✅ Saved. This document now opens offline.", "info", 2500);
+        if (!persisted) setTimeout(_offlineTipOnce, 3000);
+        return;
+    }
+    const quota = _lastOfflineError && (_lastOfflineError.name === 'QuotaExceededError' || /quota/i.test(String(_lastOfflineError.message || '')));
+    showAppNotification(quota
+        ? "⚠️ Your phone is low on storage, so this document could not be saved for offline use. Free some space and open it again."
+        : "⚠️ This document could not be saved for offline use. It will download again next time.", "warning", 6000);
+}
+
+/** Server replies that really mean "this session is over" (vs. an Apps Script hiccup such as "Validation error"). */
+function _isDefinitiveSessionFailure(msg) {
+    return /revoked|expired|mismatch|not found|different account|invalid/i.test(String(msg || ''));
+}
+function _isDefinitiveDenial(v) {
+    return !!v && (v.code === 'SESSION_INVALID' || v.code === 'SCOPE_DENIED' ||
+        /revoked|expired|mismatch|not found|denied|unavailable|different account/i.test(String(v.message || '')));
+}
+function _localExpiryValid() {
+    const e = parseInt(localStorage.getItem(`expiry_${currentTermKey}`), 10);
+    return !!e && Date.now() < e;
 }
 
 async function clearOfflineDocs() {
@@ -1069,6 +1136,7 @@ async function clearOfflineDocs() {
             tx.onerror = () => resolve(false);
             tx.onabort = () => resolve(false);
         });
+        try { db.close(); } catch (e) {}
         console.log("Offline document cache purged.");
     } catch (e) {
         console.error("Failed to clear offline cache", e);
@@ -1090,12 +1158,9 @@ async function renderPdfFromBase64(base64Data, title) {
     try {
         if (typeof pdfjsLib === 'undefined') throw new Error('PDF.js not loaded');
 
-        // Convert Base64 to Binary
-        const binaryString = atob(base64Data);
-        const bytes = new Uint8Array(binaryString.length);
-        for (let i = 0; i < binaryString.length; i++) {
-            bytes[i] = binaryString.charCodeAt(i);
-        }
+        // Raw bytes (new offline format) or Base64 text (older saves)
+        const bytes = (typeof base64Data === 'string') ? _b64ToBytes(base64Data)
+                    : (base64Data instanceof Uint8Array ? base64Data : new Uint8Array(base64Data));
 
         // Load with PDF.js
         const pdf = await pdfjsLib.getDocument({ data: bytes }).promise;
@@ -1789,18 +1854,37 @@ async function attemptOpenDoc(fileId, title, mimeType) {
         }
 
         // ── 4. ONLINE, PDF: if cached, still verify with the server before reading the cache ──
-        const cachedBase64 = await getOfflineDoc(fileId);
-        if (cachedBase64) {
+        const cachedCopy = await getOfflineDoc(fileId);
+        if (cachedCopy) {
             if (loaderText()) loaderText().textContent = 'Verifying access...';
-            const vres = await fetch(APPS_SCRIPT_URL, {
-                method: 'POST',
-                headers: { "Content-Type": "text/plain;charset=utf-8" },
-                body: JSON.stringify({ action: 'verify_document_access', file_id: fileId, session: sessionPayload })
-            });
-            const vdata = await vres.json();
-            if (!vdata.success) { _denyDocAccess(vdata); return; }
+            // A definitive "no" from the server (revoked, expired, wrong account, document removed) blocks the file.
+            // A hiccup (Apps Script error, slow or flaky network) must NOT: then the local expiry decides.
+            let allowed = false, timedOut = false;
+            const vctl = new AbortController();
+            _docAbort = vctl;
+            const vtimer = setTimeout(() => { timedOut = true; vctl.abort(); }, 8000);
+            try {
+                const vres = await fetch(APPS_SCRIPT_URL, {
+                    method: 'POST',
+                    headers: { "Content-Type": "text/plain;charset=utf-8" },
+                    body: JSON.stringify({ action: 'verify_document_access', file_id: fileId, session: sessionPayload }),
+                    signal: vctl.signal
+                });
+                const vdata = await vres.json();
+                if (vdata.success) allowed = true;
+                else if (_isDefinitiveDenial(vdata)) { _denyDocAccess(vdata); return; }
+                else allowed = _localExpiryValid();
+            } catch (e) {
+                if (e && e.name === 'AbortError' && !timedOut) return;      // the student closed the viewer
+                allowed = _localExpiryValid();
+            } finally { clearTimeout(vtimer); }
+            if (!allowed) {
+                closeDocViewer();
+                showAppNotification("⏳ Session expired. Connect to internet to verify.", "warning");
+                return;
+            }
             if (loaderText()) loaderText().textContent = 'Loading from offline cache...';
-            renderPdfFromBase64(cachedBase64, title);
+            renderPdfFromBase64(cachedCopy, title);
             return;
         }
 
@@ -1817,8 +1901,11 @@ async function attemptOpenDoc(fileId, title, mimeType) {
 
         if (data.success && data.data && data.data.base64) {
             _docProgressFinish();
-            await saveDocOffline(fileId, data.data.base64);   // save for offline use
-            renderPdfFromBase64(data.data.base64, title);
+            const pdfBytes = _b64ToBytes(data.data.base64);
+            data.data.base64 = null;                                      // free the big text copy
+            const saved = await saveDocOffline(fileId, pdfBytes.buffer);  // raw bytes: smaller, and opens without re-decoding
+            _reportOfflineSave(saved);
+            renderPdfFromBase64(pdfBytes, title);
         } else {
             _denyDocAccess(data);
         }
@@ -2117,7 +2204,11 @@ async function silentRevalidation() {
         });
         const result = await response.json();
         if (!result.success) {
-            // Session invalid – log out
+            if (!_isDefinitiveSessionFailure(result.message)) {
+                console.warn('Silent revalidation: server hiccup, keeping session', result.message);   // e.g. "Validation error"
+                return;
+            }
+            // Session really invalid – log out
             handleSessionExpired(result.message);
         }
     } catch (e) {
@@ -2142,7 +2233,11 @@ async function checkSessionStatus() {
         const result = await response.json();
         
         if (!result.success) {
-            // Session invalid — generic reason from server
+            // Session invalid — generic reason from server (but not an Apps Script hiccup such as "Status check failed")
+            if (!_isDefinitiveSessionFailure(result.message)) {
+                console.warn('Session status: server hiccup, keeping session', result.message);
+                return;
+            }
             handleSessionExpired(result.message);
             return;
         }
