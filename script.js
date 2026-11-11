@@ -25,7 +25,7 @@ const KAERI_CONFIG = {
     // ─── THE ONLY TWO ACTIVE BACKENDS ───
     
     // 1. Gatekeeper Backend (Auth, Docs, Analytics)
-    gatekeeperUrl:      "https://script.google.com/macros/s/AKfycbz3fmZTcATs1dofaJ-ZEOD3asePLaOAXdQeRAj0r97DZXyfZ3Od5POL9Kocg6PCz6sV/exec",
+    gatekeeperUrl:      "https://script.google.com/macros/s/AKfycbxnsr4iaqzgynksCdx6rnHXeenfg3Hvv6Sb-4NSGniRzwSi5mfPZ6dV1SzPtbCAqL-90g/exec",
     
     // 2. AMB-PAY Backend (Payments, Config, Bridge)
     ambPayUrl:          "https://script.google.com/macros/s/AKfycbzeN2ZWwnBReNQnvu_1GUr6qZMGmTNUi2e7-byJnFtkJRs6st2LyGyAgBKDwaP9jv5S/exec",
@@ -2106,6 +2106,59 @@ function docTypeLabel(mime) {
     return { label: 'FILE', icon: '📄' };
 }
 
+// ── Thumbnail fallback through the Gatekeeper "Middle Man" ───────────────────
+// Each card first tries Drive's own thumbnail URL. If the browser can't load it
+// (restricted file), the Gatekeeper fetches the preview as the Middle Man and
+// returns it; if that also fails, the card keeps its file-type icon.
+var _thumbCache = {};
+var _thumbQueue = [];
+var _thumbActive = 0;
+
+function thumbShowIcon_(img, icon) {
+    img.onerror = null;
+    img.style.display = 'none';
+    const box = img.parentElement;
+    if (box && !box.querySelector('.doc-thumb-fallback')) {
+        const sp = document.createElement('span');
+        sp.className = 'doc-thumb-fallback';
+        sp.style.cssText = 'font-size:48px; opacity:0.5; color:#a0a8b4;';
+        sp.textContent = icon;
+        box.insertBefore(sp, img);
+    }
+}
+
+function thumbFallback_(img, icon) {
+    img.onerror = null;                       // never loop
+    const id = img.getAttribute('data-thumb-id');
+    if (_thumbCache[id]) { img.onerror = function () { thumbShowIcon_(img, icon); }; img.src = _thumbCache[id]; return; }
+    _thumbQueue.push({ img: img, icon: icon, id: id });
+    thumbPump_();
+}
+
+function thumbPump_() {
+    while (_thumbActive < 3 && _thumbQueue.length) {
+        const job = _thumbQueue.shift();
+        _thumbActive++;
+        fetch(DOCS_SCRIPT_URL, {
+            method: 'POST',
+            redirect: 'follow',
+            headers: { "Content-Type": "text/plain;charset=utf-8" },
+            body: JSON.stringify({ action: 'GET_DOCUMENT_THUMBNAIL', file_id: job.id })
+        })
+        .then(function (r) { return r.json(); })
+        .then(function (res) {
+            const uri = res && res.success && res.data && res.data.dataUri;
+            if (uri) {
+                _thumbCache[job.id] = uri;
+                job.img.onerror = function () { thumbShowIcon_(job.img, job.icon); };
+                job.img.src = uri;
+            } else thumbShowIcon_(job.img, job.icon);
+        })
+        .catch(function () { thumbShowIcon_(job.img, job.icon); })
+        .then(function () { _thumbActive--; thumbPump_(); });
+    }
+}
+
 async function renderDocuments() {
     // IMPORTANT: Uses DOCS_SCRIPT_URL (Gatekeeper) to fetch data
     
@@ -2185,11 +2238,12 @@ async function renderDocuments() {
 
         <!-- ── THUMBNAIL CONTAINER ── -->
         <div style="width:100%; height:140px; background:linear-gradient(135deg, #1b263b, #0d1b2a); border-radius:8px; margin-bottom:12px; overflow:hidden; display:flex; align-items:center; justify-content:center; border:1px solid #3e506e; position:relative;">
-            <img src="https://drive.google.com/thumbnail?id=${doc.fileId}&sz=w400" 
+            <img src="https://drive.google.com/thumbnail?id=${doc.fileId}&sz=w400"
+                 data-thumb-id="${doc.fileId}"
                  alt="${doc.title}"
                  loading="lazy"
                  style="width:100%; height:100%; object-fit:cover; transition:0.3s;"
-                 onerror="this.style.display='none'; this.parentElement.innerHTML='<span style=\\'font-size:48px; opacity:0.5; color:#a0a8b4;\\'>${fallbackIcon}</span>';">
+                 onerror="thumbFallback_(this, '${fallbackIcon}')">
             <div style="position:absolute; bottom:6px; right:8px; background:rgba(0,0,0,0.7); padding:2px 10px; border-radius:12px; font-size:9px; color:#fff; text-transform:uppercase; letter-spacing:0.5px;">
                 ${displayType}
             </div>
