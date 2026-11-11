@@ -440,6 +440,9 @@ const MCQ_MANIFEST = {
     "BI110_T1": "assets/mcq/BI110_T1.js",
     "BI110_T2": "assets/mcq/BI110_T2.js",
     "BI110_T3": "assets/mcq/BI110_T3.js",
+    "BI111_T1": "assets/mcq/BI111_T1.js",
+    "BI111_T2": "assets/mcq/BI111_T2.js",
+    "BI111_T3": "assets/mcq/BI111_T3.js",
     "CS110_T1": "assets/mcq/CS110_T1.js",
     "CS110_T2": "assets/mcq/CS110_T2.js",
     "CS110_T3": "assets/mcq/CS110_T3.js",
@@ -454,7 +457,92 @@ const MCQ_MANIFEST = {
     "MA110_T3": "assets/mcq/MA110_T3.js",
     "LA111_T1": "assets/mcq/LA111_T1.js",
     "LA111_T2": "assets/mcq/LA111_T2.js",
-    "LA111_T3": "assets/mcq/LA111_T3.js"
+    "LA111_T3": "assets/mcq/LA111_T3.js",
+    // --- GEOLOGY YEARS 2-5 ---
+    "CH210_T1": "assets/mcq/CH210_T1.js",
+    "CH210_T2": "assets/mcq/CH210_T2.js",
+    "CH210_T3": "assets/mcq/CH210_T3.js",
+    "GM220_T1": "assets/mcq/GM220_T1.js",
+    "GM220_T2": "assets/mcq/GM220_T2.js",
+    "GM220_T3": "assets/mcq/GM220_T3.js",
+    "MA210_T1": "assets/mcq/MA210_T1.js",
+    "MA210_T2": "assets/mcq/MA210_T2.js",
+    "MA210_T3": "assets/mcq/MA210_T3.js",
+    "MI213_T1": "assets/mcq/MI213_T1.js",
+    "MI213_T2": "assets/mcq/MI213_T2.js",
+    "MI213_T3": "assets/mcq/MI213_T3.js",
+    "MT221_T1": "assets/mcq/MT221_T1.js",
+    "MT221_T2": "assets/mcq/MT221_T2.js",
+    "MT221_T3": "assets/mcq/MT221_T3.js",
+    "PH210_T1": "assets/mcq/PH210_T1.js",
+    "PH210_T2": "assets/mcq/PH210_T2.js",
+    "PH210_T3": "assets/mcq/PH210_T3.js",
+    "GM310_T1": "assets/mcq/GM310_T1.js",
+    "GM310_T2": "assets/mcq/GM310_T2.js",
+    "GM310_T3": "assets/mcq/GM310_T3.js",
+    "GM311_T1": "assets/mcq/GM311_T1.js",
+    "GM311_T2": "assets/mcq/GM311_T2.js",
+    "GM311_T3": "assets/mcq/GM311_T3.js",
+    "GM312_T1": "assets/mcq/GM312_T1.js",
+    "GM312_T2": "assets/mcq/GM312_T2.js",
+    "GM312_T3": "assets/mcq/GM312_T3.js",
+    "GM313_T1": "assets/mcq/GM313_T1.js",
+    "GM313_T2": "assets/mcq/GM313_T2.js",
+    "GM313_T3": "assets/mcq/GM313_T3.js",
+    "GM314_T1": "assets/mcq/GM314_T1.js",
+    "GM314_T2": "assets/mcq/GM314_T2.js",
+    "GM314_T3": "assets/mcq/GM314_T3.js",
+    "GM315_T1": "assets/mcq/GM315_T1.js",
+    "GM315_T2": "assets/mcq/GM315_T2.js",
+    "GM315_T3": "assets/mcq/GM315_T3.js",
+    "GM320_T1": "assets/mcq/GM320_T1.js",
+    "GM320_T2": "assets/mcq/GM320_T2.js",
+    "GM320_T3": "assets/mcq/GM320_T3.js",
+    "GM321_T1": "assets/mcq/GM321_T1.js",
+    "GM321_T2": "assets/mcq/GM321_T2.js",
+    "GM321_T3": "assets/mcq/GM321_T3.js",
+    "GM410_T1": "assets/mcq/GM410_T1.js",
+    "GM410_T2": "assets/mcq/GM410_T2.js",
+    "GM410_T3": "assets/mcq/GM410_T3.js",
+    "GM411_T1": "assets/mcq/GM411_T1.js",
+    "GM411_T2": "assets/mcq/GM411_T2.js",
+    "GM411_T3": "assets/mcq/GM411_T3.js",
+    "GM412_T1": "assets/mcq/GM412_T1.js",
+    "GM412_T2": "assets/mcq/GM412_T2.js",
+    "GM412_T3": "assets/mcq/GM412_T3.js",
+    "GM420_T1": "assets/mcq/GM420_T1.js",
+    "GM420_T2": "assets/mcq/GM420_T2.js",
+    "GM420_T3": "assets/mcq/GM420_T3.js",
+    "GM430_T1": "assets/mcq/GM430_T1.js",
+    "GM430_T2": "assets/mcq/GM430_T2.js",
+    "GM430_T3": "assets/mcq/GM430_T3.js",
+    "GM440_T1": "assets/mcq/GM440_T1.js",
+    "GM440_T2": "assets/mcq/GM440_T2.js",
+    "GM440_T3": "assets/mcq/GM440_T3.js",
+    "GM500_T1": "assets/mcq/GM500_T1.js",
+    "GM500_T2": "assets/mcq/GM500_T2.js",
+    "GM500_T3": "assets/mcq/GM500_T3.js",
+    "GM512_T1": "assets/mcq/GM512_T1.js",
+    "GM512_T2": "assets/mcq/GM512_T2.js",
+    "GM512_T3": "assets/mcq/GM512_T3.js",
+    "GM520_T1": "assets/mcq/GM520_T1.js",
+    "GM520_T2": "assets/mcq/GM520_T2.js",
+    "GM520_T3": "assets/mcq/GM520_T3.js",
+    "GM521_T1": "assets/mcq/GM521_T1.js",
+    "GM521_T2": "assets/mcq/GM521_T2.js",
+    "GM521_T3": "assets/mcq/GM521_T3.js",
+    "GM522_T1": "assets/mcq/GM522_T1.js",
+    "GM522_T2": "assets/mcq/GM522_T2.js",
+    "GM522_T3": "assets/mcq/GM522_T3.js",
+    "GM523_T1": "assets/mcq/GM523_T1.js",
+    "GM523_T2": "assets/mcq/GM523_T2.js",
+    "GM523_T3": "assets/mcq/GM523_T3.js",
+    "GM524_T1": "assets/mcq/GM524_T1.js",
+    "GM524_T2": "assets/mcq/GM524_T2.js",
+    "GM524_T3": "assets/mcq/GM524_T3.js",
+    "GM531_T1": "assets/mcq/GM531_T1.js",
+    "GM531_T2": "assets/mcq/GM531_T2.js",
+    "GM531_T3": "assets/mcq/GM531_T3.js"
 };
 
 const _mcqCache = {};
@@ -487,10 +575,15 @@ function loadMcqForTermKey(termKey) {
             resolve(usable);
         };
         script.onerror = function () {
-            // A manifest file that won't load is a FAILED load, not "no data": don't cache it,
-            // keep the mode visible and let it retry.
             script.remove();
-            _setModeFailed(termKey, 'mcq', true);
+            // A file that fails to load is treated as "no data" (hidden, no retry) unless the device is
+            // genuinely offline - the only case where retrying can help.
+            if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+                _setModeFailed(termKey, 'mcq', true);
+            } else {
+                _mcqCache[termKey] = [];
+                _setModeFailed(termKey, 'mcq', false);
+            }
             resolve([]);
         };
         document.head.appendChild(script);
@@ -660,7 +753,23 @@ function hideModeButtons() {
     if (docsBtn) docsBtn.style.display = 'none';
     _modesLoading = true;
     _docsPendingFor = null;
+    _setTermEmpty(false);
     _renderModeSkeleton();
+}
+
+// "Content coming soon": shown only once EVERY data source for the term is settled and none has content.
+function _setTermEmpty(on) {
+    document.body.classList.toggle('term-empty', !!on);
+    const box = document.getElementById('coming-soon');
+    if (!box) return;
+    box.style.display = on ? 'block' : 'none';
+    if (!on) return;
+    const t = String(currentTerm || '').replace(/^T/i, '');
+    const label = document.getElementById('coming-soon-label');
+    if (label) label.textContent = (currentCourse || '') + ' · Term ' + t;
+    const ch = document.getElementById('coming-soon-channel');
+    if (ch && typeof COMMUNITY_CONFIG !== 'undefined') ch.href = COMMUNITY_CONFIG.channel;
+    try { window.scrollTo(0, 0); } catch (e) {}
 }
 
 function applyModeAvailability() {
@@ -672,6 +781,11 @@ function applyModeAvailability() {
     const docsBtn = document.getElementById('docs-btn');
     if (docsBtn) docsBtn.style.display = has.renderDocuments ? '' : 'none';
     _modesLoading = false;
+    // Settled = the documents list is known (even if empty) or its load failed (failed never counts as empty).
+    const f = _modeLoadFailed[currentTermKey] || {};
+    const docsSettled = Array.isArray(_docsCache[currentTermKey]) || !!f.documents;
+    const anyContent = Object.keys(has).some(function (k) { return has[k]; });
+    _setTermEmpty(docsSettled && !anyContent);
     _renderModeSkeleton();
 }
 
@@ -3152,11 +3266,31 @@ function _courseOrder(keys) {
     });
 }
 
+// Course codes currently rendered in the course list (the program/year the student is browsing).
+function getLandingPageCourses() {
+    const codes = new Set();
+    document.querySelectorAll('#course-list .course-button').forEach(function (btn) {
+        const m = btn.textContent.trim().match(/^([A-Z0-9]+)/i);
+        if (m) codes.add(m[1].toUpperCase());
+    });
+    return Array.from(codes);
+}
+
 function populateCourseDropdown() {
     const courseSelect = document.getElementById('courseSelect');
     if (!courseSelect) return;
     courseSelect.innerHTML = '<option value="" disabled selected>Select Course...</option>';
-    _courseOrder(Object.keys(inventory || {})).forEach(code => {
+    // Only offer courses on the student's current list (+ Global + the course being viewed/bought).
+    const onScreen = getLandingPageCourses();
+    const keep = new Set(onScreen);
+    try {
+        const v = getViewedScope();
+        if (v && v.course) keep.add(String(v.course).toUpperCase());
+        if (purchaseIntent && purchaseIntent.course) keep.add(String(purchaseIntent.course).toUpperCase());
+    } catch (e) {}
+    const allKeys = Object.keys(inventory || {});
+    const visibleKeys = onScreen.length ? allKeys.filter(c => c === 'ALL' || keep.has(c.toUpperCase())) : allKeys;
+    _courseOrder(visibleKeys).forEach(code => {
         const opt = document.createElement('option');
         opt.value = code;
         opt.textContent = code === 'ALL' ? 'Global Access (all courses)' : code;
@@ -6109,6 +6243,7 @@ const COURSE_IDENTITY = {
     'PH110': { accent: '#ab47bc', name: 'Physics' },
     'CH110': { accent: '#ef5350', name: 'Chemistry' },
     'BI110': { accent: '#7cb342', name: 'Biology' },
+    'BI111': { accent: '#7cb342', name: 'Biology' },
     'LA111': { accent: '#ffa726', name: 'Communication Skills' },
     'MT221': { accent: '#26a69a', name: 'Mineral Processing' },
 };

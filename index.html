@@ -1610,6 +1610,8 @@
       width:100%; max-width:320px; min-height:52px; padding:14px 20px; border-radius:10px;
       font-size:1.1rem; font-weight:700; text-decoration:none; text-align:center; cursor:pointer; margin:0;
     }
+    .cta-item { display:flex; flex-direction:column; align-items:center; gap:6px; width:100%; max-width:320px; }
+    .cta-sub { font-size:.8rem; line-height:1.3; color:var(--brand-muted); text-align:center; }
     .cta-primary { background:var(--brand-accent); color:#fff; border:none; box-shadow:0 4px 12px rgba(0,123,255,.35); }
     .cta-outline { background:transparent; color:var(--brand-mint); border:2px solid var(--brand-mint); }
     .social-row { display:flex; justify-content:center; flex-wrap:wrap; gap:10px; }
@@ -1634,6 +1636,15 @@
     .icon-fab { width:48px; height:48px; border-radius:50%; background:#25D366; color:#fff; display:flex; align-items:center; justify-content:center; font-size:1.4rem; text-decoration:none; }
 
     /* Course view */
+    .coming-soon { text-align:center; padding:36px 20px; margin:10px 0 24px; background:var(--brand-bg); border:1px dashed var(--brand-line); border-radius:12px; }
+    .coming-soon .cs-icon { font-size:2.6rem; margin-bottom:6px; }
+    .coming-soon h2 { margin:0 0 6px; color:var(--brand-mint-alt); }
+    .coming-soon .cs-term { margin:0 0 14px; font-weight:700; color:#fff; letter-spacing:.5px; }
+    .coming-soon p { max-width:460px; margin:0 auto 18px; color:#a0a8b4; }
+    body.term-empty #course-view > .info-card,
+    body.term-empty #course-view > .mode-buttons,
+    body.term-empty #unlock-btn,
+    body.term-empty #price-banner { display:none !important; }
     .info-card { background:var(--brand-bg); border:1px solid var(--brand-accent); border-radius:10px; padding:12px 14px; margin-bottom:22px; }
     .info-card .announcement { background:transparent; border:none; padding:0; margin:0 0 6px; font-size:.95em; }
     .info-card summary { cursor:pointer; min-height:40px; display:flex; align-items:center; font-weight:700; color:var(--brand-mint-alt); }
@@ -1772,31 +1783,48 @@
         </div>
 
         <div class="cta-stack">
-          <button type="button" class="cta-btn cta-primary" onclick="showCourses()">📚 Courses</button>
+          <div class="cta-item">
+            <button type="button" class="cta-btn cta-primary" onclick="showSMNS()">🧬 SMNS Year 1</button>
+            <span class="cta-sub">School of Mathematics &amp; Natural Sciences</span>
+          </div>
+          <div class="cta-item">
+            <button type="button" class="cta-btn cta-primary" onclick="showGeologyYears()">⛰️ Geology (Years 1–5)</button>
+            <span class="cta-sub">School of Mines &amp; Mineral Sciences</span>
+          </div>
           <a data-amb-link class="cta-btn cta-outline" href="AMB-PORTAL.html" target="_blank" rel="noopener">🚀 Ambassador Program</a>
         </div>
 
         <div class="social-row">
           <a class="social-link" href="https://whatsapp.com/channel/0029VbCc0hEL7UVMs55diC3i" target="_blank" rel="noopener">📢 Channel</a>
-          <a class="social-link" href="https://chat.whatsapp.com/GB4UZVkxgwUGa5R4nqfDMR?mode=hqrc" target="_blank" rel="noopener">👥 Group</a>
+          <a class="social-link" id="welcome-group-link" href="https://chat.whatsapp.com/GB4UZVkxgwUGa5R4nqfDMR?mode=hqrc" target="_blank" rel="noopener">👥 Group</a>
           <a class="social-link" href="https://chat.whatsapp.com/GMQdC5pCZJtL7L17QMhdNl?s=sh&p=a&mlu=4" target="_blank" rel="noopener">🎓 Freshers</a>
         </div>
         <p class="signoff">Kaeri EdTech · Study Smarter. Grow Confident.</p>
       </section>
 
-      <!-- PAGE 2: COURSES -->
+      <!-- PAGE 2a: GEOLOGY YEAR SELECTION -->
+      <section id="years-view" style="display: none;">
+        <div class="page-head">
+          <button type="button" class="back-circle" onclick="backToPrograms()" aria-label="Back">←</button>
+          <h1>Select Geology Year</h1>
+        </div>
+        <div class="cta-stack">
+          <button type="button" class="cta-btn cta-primary" onclick="renderCourses('GEO_Y1','Geology Year 1')">Year 1</button>
+          <button type="button" class="cta-btn cta-primary" onclick="renderCourses('GEO_Y2','Geology Year 2')">Year 2</button>
+          <button type="button" class="cta-btn cta-primary" onclick="renderCourses('GEO_Y3','Geology Year 3')">Year 3</button>
+          <button type="button" class="cta-btn cta-primary" onclick="renderCourses('GEO_Y4','Geology Year 4')">Year 4</button>
+          <button type="button" class="cta-btn cta-primary" onclick="renderCourses('GEO_Y5','Geology Year 5')">Year 5</button>
+        </div>
+      </section>
+
+      <!-- PAGE 2b: COURSES (list is built from COURSE_DATA) -->
       <section id="courses-view" style="display: none;">
         <div class="page-head">
-          <button type="button" class="back-circle" onclick="hideCourses()" aria-label="Back">←</button>
-          <h1>Select a Course</h1>
+          <button type="button" class="back-circle" onclick="goBackFromCourses()" aria-label="Back">←</button>
+          <h1 id="course-list-title">Select a Course</h1>
         </div>
+        <div id="dynamic-community-links" class="social-row" style="margin-bottom:20px;"></div>
         <div id="course-list">
-        <div class="course-section"><button class="course-button" onclick="toggleTerms('bi110')">BI110 - Biology</button><div id="bi110-terms" class="term-buttons"><button onclick="loadCourse('BI110', 'T1')">Term 1</button><button onclick="loadCourse('BI110', 'T2')">Term 2</button><button onclick="loadCourse('BI110', 'T3')">Term 3</button></div></div>
-        <div class="course-section"><button class="course-button" onclick="toggleTerms('cs110')">CS110 - Computer Science</button><div id="cs110-terms" class="term-buttons"><button onclick="loadCourse('CS110', 'T1')">Term 1</button><button onclick="loadCourse('CS110', 'T2')">Term 2</button><button onclick="loadCourse('CS110', 'T3')">Term 3</button></div></div>
-        <div class="course-section"><button class="course-button" onclick="toggleTerms('la111')">LA111 - Communication Skills</button><div id="la111-terms" class="term-buttons"><button onclick="loadCourse('LA111', 'T1')">Term 1</button><button onclick="loadCourse('LA111', 'T2')">Term 2</button><button onclick="loadCourse('LA111', 'T3')">Term 3</button></div></div>
-        <div class="course-section"><button class="course-button" onclick="toggleTerms('ma110')">MA110 – Mathematics</button><div id="ma110-terms" class="term-buttons"><button onclick="loadCourse('MA110', 'T1')">Term 1</button><button onclick="loadCourse('MA110', 'T2')">Term 2</button><button onclick="loadCourse('MA110', 'T3')">Term 3</button></div></div>
-        <div class="course-section"><button class="course-button" onclick="toggleTerms('ph110')">PH110 – Physics</button><div id="ph110-terms" class="term-buttons"><button onclick="loadCourse('PH110', 'T1')">Term 1</button><button onclick="loadCourse('PH110', 'T2')">Term 2</button><button onclick="loadCourse('PH110', 'T3')">Term 3</button></div></div>
-        <div class="course-section"><button class="course-button" onclick="toggleTerms('ch110')">CH110 – Chemistry</button><div id="ch110-terms" class="term-buttons"><button onclick="loadCourse('CH110', 'T1')">Term 1</button><button onclick="loadCourse('CH110', 'T2')">Term 2</button><button onclick="loadCourse('CH110', 'T3')">Term 3</button></div></div>
         </div>
         <div class="page-footer">
           <hr>
@@ -1853,6 +1881,15 @@
         <button onclick="renderFlashcardTopics()">🃏 Flashcards</button>
       </div>
 
+      <!-- Shown by script.js only when the term has no data of any kind -->
+      <div id="coming-soon" class="coming-soon" style="display:none;" role="status">
+        <div class="cs-icon" aria-hidden="true">🛠️</div>
+        <h2>Content Coming Soon</h2>
+        <p class="cs-term" id="coming-soon-label"></p>
+        <p>Our team is preparing practice questions, flashcards and study materials for this term. They will appear here automatically as soon as they are published.</p>
+        <a id="coming-soon-channel" class="pill-link" href="https://whatsapp.com/channel/0029VbCc0hEL7UVMs55diC3i" target="_blank" rel="noopener" style="border:1px solid #25D366; color:#25D366;">📢 Follow the channel for updates</a>
+      </div>
+
       <div id="quiz-form"></div>
       <div id="result"></div>
 
@@ -1866,7 +1903,7 @@
         <p style="margin:0; color:var(--brand-muted); font-size:.9em;">Stay connected with us:</p>
         <div class="pill-row">
           <a class="pill-link" href="https://whatsapp.com/channel/0029VbCc0hEL7UVMs55diC3i" target="_blank" rel="noopener" style="border:1px solid #25D366; color:#25D366;">📢 Official Channel</a>
-          <a class="pill-link" href="https://chat.whatsapp.com/GB4UZVkxgwUGa5R4nqfDMR" target="_blank" rel="noopener" style="background:#25D366; color:#fff;">👥 Discussion Group 2</a>
+          <a class="pill-link" id="footer-group-link" href="https://chat.whatsapp.com/GB4UZVkxgwUGa5R4nqfDMR?mode=hqrc" target="_blank" rel="noopener" style="background:#25D366; color:#fff;">👥 Discussion Group</a>
         </div>
         <hr>
         <a data-amb-link class="pill-link pill-amb" href="AMB-PORTAL.html" target="_blank" rel="noopener">🚀 Become an Ambassador →</a>
@@ -2285,6 +2322,147 @@
   <script src="assets/motivation.js"></script>
   <script src="acc.js"></script>
   <script src="script.js"></script>
+
+  <!-- PROGRAM / YEAR ROUTING + COMMUNITY LINKS -->
+  <script>
+  // ===== CONFIG: paste your WhatsApp links here =====
+  const COMMUNITY_CONFIG = {
+    channel:      'https://whatsapp.com/channel/0029VbCc0hEL7UVMs55diC3i',   // universal
+    support:      'https://wa.me/260964312504',                              // universal
+    smnsGroup:    'https://chat.whatsapp.com/GB4UZVkxgwUGa5R4nqfDMR?mode=hqrc',
+    geologyGroup: 'https://chat.whatsapp.com/CnIBDd3l9eJ732pZDIiyw4?s=cl&p=a&iam=2'
+  };
+  // ==================================================
+
+  // Course codes follow your existing manifest/pricing keys (BI110, not BI111).
+  const _YEAR1 = [
+    { id: 'bi110', code: 'BI110', name: 'Biology' },
+    { id: 'cs110', code: 'CS110', name: 'Computer Science' },
+    { id: 'la111', code: 'LA111', name: 'Communication Skills' },
+    { id: 'ma110', code: 'MA110', name: 'Mathematics' },
+    { id: 'ph110', code: 'PH110', name: 'Physics' },
+    { id: 'ch110', code: 'CH110', name: 'Chemistry' }
+  ];
+  const COURSE_DATA = {
+    SMNS_Y1: _YEAR1,
+    GEO_Y1: _YEAR1.map(c => c.code === 'BI110' ? { id: 'bi111', code: 'BI111', name: 'Biology' } : c),
+    GEO_Y2: [
+      { id: 'ch210', code: 'CH210', name: 'Chemistry II' },
+      { id: 'gm220', code: 'GM220', name: 'Fundamentals of Geology' },
+      { id: 'ma210', code: 'MA210', name: 'Mathematics II' },
+      { id: 'mi213', code: 'MI213', name: 'Introduction to Mining Engineering' },
+      { id: 'mt221', code: 'MT221', name: 'Introduction to Metallurgy' },
+      { id: 'ph210', code: 'PH210', name: 'Physics II' }
+    ],
+    GEO_Y3: [
+      { id: 'gm310', code: 'GM310', name: 'Mineralogy and Petrology' },
+      { id: 'gm311', code: 'GM311', name: 'Probability and Statistical Analysis' },
+      { id: 'gm312', code: 'GM312', name: 'Photogrammetry and Remote Sensing' },
+      { id: 'gm313', code: 'GM313', name: 'Structural Geology I' },
+      { id: 'gm314', code: 'GM314', name: 'Introductory Geomatics Engineering' },
+      { id: 'gm315', code: 'GM315', name: 'Geo-informatics and Computing' },
+      { id: 'gm320', code: 'GM320', name: 'Stratigraphy and Sedimentary Petrology' },
+      { id: 'gm321', code: 'GM321', name: 'Regolith Geology and Palaeoclimate' }
+    ],
+    GEO_Y4: [
+      { id: 'gm410', code: 'GM410', name: 'Igneous and Metamorphic Petrology' },
+      { id: 'gm411', code: 'GM411', name: 'Rock Mechanics and Engineering Geology' },
+      { id: 'gm412', code: 'GM412', name: 'Structural Geology II' },
+      { id: 'gm420', code: 'GM420', name: 'Mining and Exploration Geology' },
+      { id: 'gm430', code: 'GM430', name: 'Economic Geology' },
+      { id: 'gm440', code: 'GM440', name: 'Surface Processes & Geochemical Exploration' }
+    ],
+    GEO_Y5: [
+      { id: 'gm500', code: 'GM500', name: 'Special Project' },
+      { id: 'gm512', code: 'GM512', name: 'Independent Mapping Project' },
+      { id: 'gm520', code: 'GM520', name: 'Geostatistics and Resource Estimation' },
+      { id: 'gm521', code: 'GM521', name: 'Geophysics' },
+      { id: 'gm522', code: 'GM522', name: 'Geology of Zambia' },
+      { id: 'gm523', code: 'GM523', name: 'Management, Mine Economics & Deposit Evaluation' },
+      { id: 'gm524', code: 'GM524', name: 'Entrepreneurship and Small Scale Business Management' },
+      { id: 'gm531', code: 'GM531', name: 'Hydrogeology' }
+    ]
+  };
+
+  let currentListKey = 'SMNS_Y1';
+  const _el = id => document.getElementById(id);
+
+  function _groupLinkFor(key) {
+    const g = String(key).indexOf('GEO') === 0 ? COMMUNITY_CONFIG.geologyGroup : COMMUNITY_CONFIG.smnsGroup;
+    return g || '';
+  }
+
+  // Builds the course list + community links WITHOUT changing which screen is visible.
+  function buildCourseList(key, title) {
+    currentListKey = key;
+    const t = _el('course-list-title');
+    if (t) t.textContent = title || (key === 'SMNS_Y1' ? 'SMNS Year 1' : 'Geology ' + key.replace('GEO_Y', 'Year '));
+
+    const group = _groupLinkFor(key);
+    const comm = _el('dynamic-community-links');
+    if (comm) comm.innerHTML =
+      '<a class="social-link" href="' + COMMUNITY_CONFIG.channel + '" target="_blank" rel="noopener">📢 Channel</a>' +
+      (group ? '<a class="social-link" href="' + group + '" target="_blank" rel="noopener">👥 Join Group</a>' : '');
+    const fl = _el('footer-group-link');
+    if (fl) { if (group) { fl.href = group; fl.style.display = ''; } else fl.style.display = 'none'; }
+
+    const list = _el('course-list');
+    list.innerHTML = '';
+    (COURSE_DATA[key] || []).forEach(c => {
+      const div = document.createElement('div');
+      div.className = 'course-section';
+      div.innerHTML =
+        '<button class="course-button" onclick="toggleTerms(\'' + c.id + '\')">' + c.code + ' - ' + c.name + '</button>' +
+        '<div id="' + c.id + '-terms" class="term-buttons">' +
+        ['T1', 'T2', 'T3'].map((x, i) => '<button onclick="loadCourse(\'' + c.code + '\', \'' + x + '\')">Term ' + (i + 1) + '</button>').join('') +
+        '</div>';
+      list.appendChild(div);
+    });
+    // Same rule as before: no dataset in MCQ_MANIFEST -> no button.
+    try { hideUnavailableTerms(); } catch (e) {}
+    const anyShown = Array.prototype.some.call(list.querySelectorAll('.course-section'), s => s.style.display !== 'none');
+    if (!anyShown) {
+      const p = document.createElement('p');
+      p.style.cssText = 'text-align:center;color:#a0a8b4;padding:20px 0;';
+      p.textContent = 'Study material for this year is coming soon. Join the channel to be notified.';
+      list.appendChild(p);
+    }
+  }
+
+  function showSMNS() {
+    buildCourseList('SMNS_Y1', 'SMNS Year 1');
+    _swapViews(_el('welcome-view'), _el('courses-view'), false);
+  }
+  function showGeologyYears() {
+    _swapViews(_el('welcome-view'), _el('years-view'), false);
+  }
+  function backToPrograms() {
+    _swapViews(_el('years-view'), _el('welcome-view'), false);
+  }
+  function renderCourses(key, title) {
+    buildCourseList(key, title);
+    _swapViews(_el('years-view'), _el('courses-view'), false);
+  }
+  function goBackFromCourses() {
+    collapseAllTerms();
+    if (currentListKey.indexOf('GEO_Y') === 0) _swapViews(_el('courses-view'), _el('years-view'), false);
+    else _swapViews(_el('courses-view'), _el('welcome-view'), false);
+  }
+
+  // Which program list contains this course code? (SMNS wins for shared Year 1 courses)
+  function programKeyForCourse(code) {
+    code = String(code || '').toUpperCase();
+    return Object.keys(COURSE_DATA).filter(k => COURSE_DATA[k].some(c => c.code === code))[0] || 'SMNS_Y1';
+  }
+
+  // Boot: always have a list in the DOM (deep links like ?course=GM310&term=T1 never see an empty one).
+  document.addEventListener('DOMContentLoaded', function () {
+    const wg = _el('welcome-group-link');
+    if (wg) wg.href = COMMUNITY_CONFIG.smnsGroup;
+    const c = new URLSearchParams(location.search).get('course');
+    buildCourseList(c ? programKeyForCourse(c) : 'SMNS_Y1');
+  });
+  </script>
 <script src="ExamCountdown.js"></script>
 <script src="ScoreCelebration.js"></script>
 <script src="Advanced_SA.js"></script>
