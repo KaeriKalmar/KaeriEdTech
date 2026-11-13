@@ -13,6 +13,223 @@
 // === v1.7 PATCH: STRICTLY TWO BACKENDS ONLY (Gatekeeper & AMB-PAY) ===
 // ============================================================
 
+
+// ============================================================================
+// === VIDEO SERVICE WORKER (merged) ==========================================
+// This same file is also registered as the service worker (see _vidEnsureSW).
+// In the worker, the page code below cannot run (no DOM), so we only install
+// harmless shims and the video range proxy, then every UI statement is inert.
+// ============================================================================
+const _IS_SW = (typeof ServiceWorkerGlobalScope !== 'undefined') && (self instanceof ServiceWorkerGlobalScope);
+if (_IS_SW) {
+    (function () {
+        const noop = function () {};
+        const fakeEl = function () { return { style: {}, classList: { add: noop, remove: noop, toggle: noop, contains: function () { return false; } }, setAttribute: noop, appendChild: noop, addEventListener: noop, querySelector: function () { return null; }, querySelectorAll: function () { return []; } }; };
+        const store = function () { return { getItem: function () { return null; }, setItem: noop, removeItem: noop, clear: noop, key: function () { return null; }, length: 0 }; };
+        self.window = self;
+        self.document = { hidden: false, readyState: 'complete', addEventListener: noop, removeEventListener: noop, getElementById: function () { return null; }, querySelector: function () { return null; }, querySelectorAll: function () { return []; }, createElement: fakeEl, head: fakeEl(), body: fakeEl(), documentElement: fakeEl() };
+        try { self.localStorage = store(); } catch (e) {}
+        try { self.sessionStorage = store(); } catch (e) {}
+        if (typeof self.MutationObserver === 'undefined') self.MutationObserver = function () { return { observe: noop, disconnect: noop }; };
+    })();
+    (function () {
+        const CHUNK = 3 * 1024 * 1024;
+        const CACHE = 'kaeri-video-chunks-v1';
+        const SCOPE = self.registration.scope;
+
+        const metaMem = {};     // fileId → { total, mime }
+        const ctxMem = {};      // fileId → { u, c, e, d }
+        const inflight = {};    // "fileId:idx" → Promise<Uint8Array>
+        const stopFlags = {};   // fileId → true while a background fill must stop
+
+        self.addEventListener('install', function () { self.skipWaiting(); });
+        self.addEventListener('activate', function (e) { e.waitUntil(self.clients.claim()); });
+
+        function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+        function keyFor(kind, id, idx) {
+          var p = '__' + kind + '__/' + encodeURIComponent(id) + (idx === undefined ? '' : '/' + idx);
+          return new Request(new URL(p, SCOPE).href);
+        }
+        function b64ToBytes(b64) {
+          var bin = atob(b64), out = new Uint8Array(bin.length);
+          for (var i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+          return out;
+        }
+        function replyCode(j) { return j && (j.code || (j.data && j.data.code)); }
+        function isDenial(j) {
+          var c = replyCode(j);
+          return !!j && (c === 'SESSION_INVALID' || c === 'SCOPE_DENIED' || c === 'DRIVE_UNAVAILABLE' ||
+            /revoked|expired|mismatch|not found|denied|unavailable|different account/i.test(String(j.message || '')));
+        }
+        function post(msg) {
+          return self.clients.matchAll({ includeUncontrolled: true }).then(function (cs) {
+            cs.forEach(function (c) { c.postMessage(msg); });
+          });
+        }
+        function failWith(id, e) {
+          var reply = (e && e.reply) || { success: false, message: (e && e.message) || 'Download failed' };
+          return post({ type: 'VID_FAIL', id: id, reply: reply });
+        }
+
+        async function getCtx(id) {
+          if (ctxMem[id]) return ctxMem[id];
+          var hit = await (await caches.open(CACHE)).match(keyFor('kctx', id));
+          if (hit) { ctxMem[id] = await hit.json(); return ctxMem[id]; }
+          var err = new Error('Session required'); err.reply = { success: false, message: 'Session required', code: 'SESSION_INVALID' };
+          throw err;
+        }
+
+        // One Gatekeeper call = one chunk (3 attempts, stops early when the answer is a real denial).
+        async function callGatekeeper(ctx, id, idx) {
+          var last = null;
+          for (var a = 0; a < 3; a++) {
+            try {
+              var res = await fetch(ctx.u, {
+                method: 'POST',
+                headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+                body: JSON.stringify({ action: 'get_video_chunk', file_id: id, start: idx * CHUNK, length: CHUNK,
+                  session: { code: ctx.c, email: ctx.e, device_fp: ctx.d } })
+              });
+              var j = await res.json();
+              if (j && j.success && j.data && typeof j.data.base64 === 'string') return j;
+              last = j;
+              if (isDenial(j)) break;
+            } catch (e) { last = { success: false, message: 'Network error' }; }
+            await sleep(800 * (a + 1));
+          }
+          var err = new Error((last && last.message) || 'Download failed');
+          err.reply = last;
+          throw err;
+        }
+
+        async function storeChunk(id, idx, j, bytes) {
+          metaMem[id] = { total: j.data.total, mime: j.data.mimeType || 'video/mp4' };
+          try {
+            var cache = await caches.open(CACHE);
+            await cache.put(keyFor('kmeta', id), new Response(JSON.stringify(metaMem[id]), { headers: { 'Content-Type': 'application/json' } }));
+            await cache.put(keyFor('kchunk', id, idx), new Response(bytes, { headers: { 'Content-Type': 'application/octet-stream' } }));
+          } catch (e) { /* storage full: playback still works, it just is not saved */ }
+        }
+
+        async function getChunk(id, idx, ctx) {
+          var cache = await caches.open(CACHE);
+          var hit = await cache.match(keyFor('kchunk', id, idx));
+          if (hit) return new Uint8Array(await hit.arrayBuffer());
+          var fk = id + ':' + idx;
+          if (inflight[fk]) return inflight[fk];
+          var p = (async function () {
+            var j = await callGatekeeper(ctx, id, idx);
+            var bytes = b64ToBytes(j.data.base64);
+            await storeChunk(id, idx, j, bytes);
+            return bytes;
+          })();
+          inflight[fk] = p;
+          try { return await p; } finally { delete inflight[fk]; }
+        }
+
+        async function getMeta(id, ctx) {
+          if (metaMem[id]) return metaMem[id];
+          var hit = await (await caches.open(CACHE)).match(keyFor('kmeta', id));
+          if (hit) { metaMem[id] = await hit.json(); return metaMem[id]; }
+          await getChunk(id, 0, ctx);
+          if (!metaMem[id]) {   // chunk 0 was cached but meta was lost: ask the Gatekeeper once
+            var j = await callGatekeeper(ctx, id, 0);
+            await storeChunk(id, 0, j, b64ToBytes(j.data.base64));
+          }
+          return metaMem[id];
+        }
+
+        async function handle(req, id) {
+          var ctx, meta;
+          try { ctx = await getCtx(id); meta = await getMeta(id, ctx); }
+          catch (e) { failWith(id, e); return new Response('Forbidden', { status: 403 }); }
+
+          var total = meta.total, start = 0, end = total - 1;
+          var rh = req.headers.get('range');
+          var m = rh && /^bytes=(\d*)-(\d*)$/.exec(rh.trim());
+          if (m) {
+            if (m[1] === '' && m[2] !== '') start = Math.max(0, total - parseInt(m[2], 10));
+            else { start = parseInt(m[1], 10); if (m[2] !== '') end = Math.min(parseInt(m[2], 10), total - 1); }
+          }
+          if (!(start >= 0) || start >= total || end < start) {
+            return new Response(null, { status: 416, headers: { 'Content-Range': 'bytes */' + total } });
+          }
+
+          var firstIdx = Math.floor(start / CHUNK), lastIdx = Math.floor(end / CHUNK);
+          var idx = firstIdx, cancelled = false;
+
+          var body = new ReadableStream({
+            async pull(controller) {
+              if (cancelled) return;
+              try {
+                for (var k = 1; k <= 2; k++) if (idx + k <= lastIdx) getChunk(id, idx + k, ctx).catch(function () {});   // download ahead
+                var bytes = await getChunk(id, idx, ctx);
+                var base = idx * CHUNK;
+                var from = Math.max(start, base) - base;
+                var to = Math.min(end + 1, base + bytes.length) - base;
+                controller.enqueue(bytes.subarray(from, to));
+                idx++;
+                if (idx > lastIdx) controller.close();
+              } catch (e) { failWith(id, e); controller.error(e); }
+            },
+            cancel: function () { cancelled = true; }
+          });
+
+          var headers = { 'Content-Type': meta.mime, 'Accept-Ranges': 'bytes', 'Content-Length': String(end - start + 1), 'Cache-Control': 'no-store' };
+          if (m) headers['Content-Range'] = 'bytes ' + start + '-' + end + '/' + total;
+          return new Response(body, { status: m ? 206 : 200, headers: headers });
+        }
+
+        async function fillAll(id) {
+          stopFlags[id] = false;
+          var ctx, meta;
+          try { ctx = await getCtx(id); meta = await getMeta(id, ctx); } catch (e) { failWith(id, e); return; }
+          var count = Math.ceil(meta.total / CHUNK);
+          var cache = await caches.open(CACHE);
+          var missing = [];
+          for (var i = 0; i < count; i++) if (!(await cache.match(keyFor('kchunk', id, i)))) missing.push(i);
+          var done = count - missing.length;
+          await post({ type: 'VID_FILL', id: id, done: done, count: count });
+          var next = 0;
+          async function worker() {
+            while (!stopFlags[id]) {
+              var n = next++;
+              if (n >= missing.length) return;
+              try { await getChunk(id, missing[n], ctx); }
+              catch (e) { failWith(id, e); stopFlags[id] = true; return; }
+              done = Math.min(count, done + 1);
+              await post({ type: 'VID_FILL', id: id, done: done, count: count });
+            }
+          }
+          await Promise.all([worker(), worker()]);
+        }
+
+        self.addEventListener('fetch', function (event) {
+          var url = new URL(event.request.url);
+          if (url.origin !== self.location.origin) return;
+          var m = /\/__kvid__\/([^\/]+)\.mp4$/.exec(url.pathname);
+          if (!m) return;
+          event.respondWith(handle(event.request, decodeURIComponent(m[1])));
+        });
+
+        self.addEventListener('message', function (event) {
+          var d = event.data || {};
+          if (d.type === 'VID_CLAIM') { event.waitUntil(self.clients.claim()); return; }
+          if (d.type === 'VID_CTX') {
+            ctxMem[d.id] = d.ctx;
+            event.waitUntil((async function () {
+              try { await (await caches.open(CACHE)).put(keyFor('kctx', d.id), new Response(JSON.stringify(d.ctx))); } catch (e) {}
+              if (event.ports && event.ports[0]) event.ports[0].postMessage('ok');
+            })());
+          } else if (d.type === 'VID_FILL') {
+            event.waitUntil(fillAll(d.id));
+          } else if (d.type === 'VID_STOP') {
+            stopFlags[d.id] = true;
+          }
+        });
+    })();
+}
+
 // --- CONFIGURATION ---
 
 const KAERI_CONFIG = {
@@ -25,7 +242,7 @@ const KAERI_CONFIG = {
     // ─── THE ONLY TWO ACTIVE BACKENDS ───
     
     // 1. Gatekeeper Backend (Auth, Docs, Analytics)
-    gatekeeperUrl:      "https://script.google.com/macros/s/AKfycbxnsr4iaqzgynksCdx6rnHXeenfg3Hvv6Sb-4NSGniRzwSi5mfPZ6dV1SzPtbCAqL-90g/exec",
+    gatekeeperUrl:      "https://script.google.com/macros/s/AKfycbz-MRtXXBc57A4TQAlja7vfJN3I7umOWALMZiN_-TPYkzRHn8uX7LURrnG0TNRokPFfiQ/exec",
     
     // 2. AMB-PAY Backend (Payments, Config, Bridge)
     ambPayUrl:          "https://script.google.com/macros/s/AKfycbzeN2ZWwnBReNQnvu_1GUr6qZMGmTNUi2e7-byJnFtkJRs6st2LyGyAgBKDwaP9jv5S/exec",
@@ -685,6 +902,7 @@ function loadFlashcardsForTermKey(termKey, course, term) {
 // problem is never mistaken for "no data": a failed mode stays visible and is retried.
 const _modeLoadFailed = {};   // termKey → { mcq, essay, flashcard, documents }
 const _docsCache = {};        // termKey → documents list from the Gatekeeper ([] = this term has none)
+const _videosCache = {};      // termKey → videos list from the Gatekeeper ([] = this term has none)
 
 // Terms that have content but no MCQ file (e.g. documents only). Add "COURSE_TERM": true here;
 // everything else is judged by MCQ_MANIFEST. Leave empty until you need it.
@@ -695,6 +913,7 @@ const _MODE_FNS = ['renderQuiz', 'renderShortAnswers', 'renderEssaySimulation', 
 // (the .skeleton class used by the Documents library) instead of sitting empty.
 let _modesLoading = false;       // true from the moment a term is tapped until its data is confirmed
 let _docsPendingFor = null;      // termKey whose Documents list is still being fetched
+let _videosPendingFor = null;    // termKey whose Videos list is still being fetched
 
 // IMPORTANT: must stay idempotent — it removes any existing tiles first and rebuilds from state, because
 // it is called from hideModeButtons, applyModeAvailability, _loadDocsAvailability and the retry paths.
@@ -703,7 +922,8 @@ function _renderModeSkeleton() {
     if (!grid) return;
     grid.querySelectorAll('.mode-skel').forEach(function (el) { el.remove(); });
     const docsPending = !_modesLoading && !!_docsPendingFor && _docsPendingFor === currentTermKey;
-    if (_modesLoading || docsPending) grid.setAttribute('aria-busy', 'true'); else grid.removeAttribute('aria-busy');
+    const videosPending = !_modesLoading && !!_videosPendingFor && _videosPendingFor === currentTermKey;
+    if (_modesLoading || docsPending || videosPending) grid.setAttribute('aria-busy', 'true'); else grid.removeAttribute('aria-busy');
 
     function tile(first) {
         const t = document.createElement('div');
@@ -722,6 +942,13 @@ function _renderModeSkeleton() {
         if (docsBtn && docsBtn.parentNode === grid) grid.insertBefore(tile(false), docsBtn);
         else grid.appendChild(tile(false));
     }
+    if (videosPending) {
+        // Same treatment for Videos: one tile in the Videos button's own slot (right after Documents)
+        // until its list is known, so it shimmers in exactly like every other mode instead of popping up.
+        const videosBtn = document.getElementById('videos-btn');
+        if (videosBtn && videosBtn.parentNode === grid) grid.insertBefore(tile(false), videosBtn);
+        else grid.appendChild(tile(false));
+    }
 }
 
 function _setModeFailed(termKey, kind, val) {
@@ -735,7 +962,8 @@ function _modeAvailability() {
         renderShortAnswers:    (currentShortData || []).length > 0,
         renderEssaySimulation: (currentEssayData || []).length > 0 || !!f.essay,
         renderFlashcardTopics: Object.keys(currentFlashcardTopics || {}).length > 0 || !!f.flashcard,
-        renderDocuments:       (_docsCache[currentTermKey] || []).length > 0 || !!f.documents
+        renderDocuments:       (_docsCache[currentTermKey] || []).length > 0 || !!f.documents,
+        renderVideos:          (_videosCache[currentTermKey] || []).length > 0
     };
 }
 
@@ -751,8 +979,11 @@ function hideModeButtons() {
     });
     const docsBtn = document.getElementById('docs-btn');
     if (docsBtn) docsBtn.style.display = 'none';
+    const videosBtn = document.getElementById('videos-btn');
+    if (videosBtn) videosBtn.style.display = 'none';
     _modesLoading = true;
     _docsPendingFor = null;
+    _videosPendingFor = null;
     _setTermEmpty(false);
     _renderModeSkeleton();
 }
@@ -780,12 +1011,15 @@ function applyModeAvailability() {
     });
     const docsBtn = document.getElementById('docs-btn');
     if (docsBtn) docsBtn.style.display = has.renderDocuments ? '' : 'none';
+    const videosBtn = document.getElementById('videos-btn');
+    if (videosBtn) videosBtn.style.display = has.renderVideos ? '' : 'none';
     _modesLoading = false;
     // Settled = the documents list is known (even if empty) or its load failed (failed never counts as empty).
     const f = _modeLoadFailed[currentTermKey] || {};
     const docsSettled = Array.isArray(_docsCache[currentTermKey]) || !!f.documents;
+    const videosSettled = Array.isArray(_videosCache[currentTermKey]) || !!f.videos;   // a video-only term must not flash "coming soon"
     const anyContent = Object.keys(has).some(function (k) { return has[k]; });
-    _setTermEmpty(docsSettled && !anyContent);
+    _setTermEmpty(docsSettled && videosSettled && !anyContent);
     _renderModeSkeleton();
 }
 
@@ -841,6 +1075,51 @@ async function _loadDocsAvailability(termKey, course, term, attempt) {
     if (list === null && attempt < 3) {
         setTimeout(function () {
             if (currentTermKey === termKey) _loadDocsAvailability(termKey, course, term, attempt + 1);
+        }, 6000);
+    }
+}
+
+// Videos live on the Gatekeeper too (separate "Videos" sheet). Same contract as documents:
+// resolves to the list, or null when the request itself failed. The last good list is kept on the
+// device so the Videos button and the saved (offline) videos still work without a connection.
+async function _fetchVideosForTerm(termKey, course, term) {
+    const failed = !!(_modeLoadFailed[termKey] && _modeLoadFailed[termKey].videos);
+    if (_videosCache[termKey] && !failed) return _videosCache[termKey];
+    try {
+        const response = await fetch(DOCS_SCRIPT_URL, {
+            method: 'POST',
+            redirect: 'follow',
+            headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+            body: JSON.stringify({ action: 'GET_STUDENT_VIDEOS', course: course, term: term })
+        });
+        if (!response.ok) throw new Error('videos http ' + response.status);
+        const data = await response.json();
+        if (!data || !data.success) throw new Error('videos not ok');
+        const list = (data.data && data.data.videos) || data.videos || [];
+        _videosCache[termKey] = list;
+        _setModeFailed(termKey, 'videos', false);
+        try { localStorage.setItem('kaeri_videos_' + termKey, JSON.stringify(list)); } catch (e) {}
+        return list;
+    } catch (e) {
+        _setModeFailed(termKey, 'videos', true);
+        try {
+            const saved = JSON.parse(localStorage.getItem('kaeri_videos_' + termKey) || 'null');
+            if (Array.isArray(saved)) _videosCache[termKey] = saved;
+        } catch (err) {}
+        return null;
+    }
+}
+
+async function _loadVideosAvailability(termKey, course, term, attempt) {
+    attempt = attempt || 1;
+    if (!_videosCache[termKey]) { _videosPendingFor = termKey; _renderModeSkeleton(); }   // one shimmer tile until Videos is known
+    const list = await _fetchVideosForTerm(termKey, course, term);
+    if (_videosPendingFor === termKey) _videosPendingFor = null;
+    if (currentTermKey !== termKey) return;
+    applyModeAvailability();
+    if (list === null && attempt < 3) {
+        setTimeout(function () {
+            if (currentTermKey === termKey) _loadVideosAvailability(termKey, course, term, attempt + 1);
         }, 6000);
     }
 }
@@ -966,6 +1245,30 @@ async function initializeCourseLogic() {
                 modeButtonsDiv.appendChild(docBtn);
             }
         }
+
+        // Add Video Button if missing (sits right after Documents)
+        if (!document.getElementById('videos-btn')) {
+            const vidBtn = document.createElement('button');
+            vidBtn.id = 'videos-btn';
+            vidBtn.style.display = 'none';   // revealed by applyModeAvailability() once the term has videos
+            vidBtn.innerHTML = "📺 Course Videos";
+            vidBtn.style.backgroundColor = "#dc3545";
+            vidBtn.style.color = "white";
+            vidBtn.style.border = "none";
+            vidBtn.style.padding = "15px 20px";
+            vidBtn.style.fontSize = "1.1em";
+            vidBtn.style.borderRadius = "8px";
+            vidBtn.style.boxShadow = "0 4px 8px rgba(0,0,0,0.2)";
+            vidBtn.style.cursor = "pointer";
+            vidBtn.onclick = renderVideos;
+
+            const afterDocs = document.getElementById('docs-btn');
+            if (afterDocs && afterDocs.parentNode === modeButtonsDiv) {
+                modeButtonsDiv.insertBefore(vidBtn, afterDocs.nextSibling);
+            } else {
+                modeButtonsDiv.appendChild(vidBtn);
+            }
+        }
     }
 
     // Context Setup
@@ -984,6 +1287,7 @@ async function initializeCourseLogic() {
     applyModeAvailability();
     _healFailedLoads(currentTermKey);
     _loadDocsAvailability(currentTermKey, currentCourse, currentTerm);   // background; Documents appears when the list is non-empty
+    _loadVideosAvailability(currentTermKey, currentCourse, currentTerm); // background; Videos appears when the list is non-empty
 
     // Inject Viewer HTML if missing
     if (!document.getElementById('smart-doc-viewer')) {
@@ -1251,6 +1555,7 @@ async function clearOfflineDocs() {
             tx.onabort = () => resolve(false);
         });
         try { db.close(); } catch (e) {}
+        try { if ('caches' in window) await caches.delete('kaeri-video-chunks-v1'); } catch (e) {}   // saved video chunks (service worker in script.js)
         console.log("Offline document cache purged.");
     } catch (e) {
         console.error("Failed to clear offline cache", e);
@@ -1726,6 +2031,7 @@ function _docResetUi() {
     const set = document.getElementById('doc-reader-settings');
     if (set) set.style.display = 'none';
     if (_docPdf) { try { _docPdf.destroy(); } catch (e) {} _docPdf = null; }
+    _vidRelease();   // stop a playing video and free its memory
 }
 
 /** Engine callback (see stopReading): something else stopped the speech, so the document reader is no longer "reading". */
@@ -2106,13 +2412,25 @@ function docTypeLabel(mime) {
     return { label: 'FILE', icon: '📄' };
 }
 
-// ── Thumbnail fallback through the Gatekeeper "Middle Man" ───────────────────
-// Each card first tries Drive's own thumbnail URL. If the browser can't load it
-// (restricted file), the Gatekeeper fetches the preview as the Middle Man and
-// returns it; if that also fails, the card keeps its file-type icon.
-var _thumbCache = {};
-var _thumbQueue = [];
-var _thumbActive = 0;
+// ── Thumbnail fallback ───────────────────────────────────────────────────────
+// Two INDEPENDENT pipelines, each with its own cache, queue and in-flight count.
+//
+//   DOCUMENTS — the four-layer fast path (unchanged behaviour):
+//     1. Drive's unauthenticated CDN (handles shared/public files directly)
+//     2. In-page cache (_docThumbCache)
+//     3. Gatekeeper + CacheService (only for private files that miss the CDN)
+//     4. File-type icon
+//
+//   VIDEOS — the slow path only (its own pipeline):
+//     1. Drive's CDN (always fails for private videos, so effectively skipped)
+//     2. In-page cache (_vidThumbCache)
+//     3. Gatekeeper + CacheService
+//     4. 🎥 icon
+//
+// Why they are separate: v9.10 put every video thumbnail into the SAME 3-wide
+// queue the documents fallback uses. A library with 10 videos therefore kept
+// the queue busy for several seconds and slowed the documents view down (and
+// vice versa). Videos now queue on their own pump and cannot delay documents.
 
 function thumbShowIcon_(img, icon) {
     img.onerror = null;
@@ -2127,18 +2445,27 @@ function thumbShowIcon_(img, icon) {
     }
 }
 
+// ── DOCUMENTS pipeline (fast, original four layers) ─────────────────────────
+var _docThumbCache  = {};
+var _docThumbQueue  = [];
+var _docThumbActive = 0;
+
 function thumbFallback_(img, icon) {
-    img.onerror = null;                       // never loop
+    img.onerror = null;                          // never loop
     const id = img.getAttribute('data-thumb-id');
-    if (_thumbCache[id]) { img.onerror = function () { thumbShowIcon_(img, icon); }; img.src = _thumbCache[id]; return; }
-    _thumbQueue.push({ img: img, icon: icon, id: id });
+    if (_docThumbCache[id]) {
+        img.onerror = function () { thumbShowIcon_(img, icon); };
+        img.src = _docThumbCache[id];
+        return;
+    }
+    _docThumbQueue.push({ img: img, icon: icon, id: id });
     thumbPump_();
 }
 
 function thumbPump_() {
-    while (_thumbActive < 3 && _thumbQueue.length) {
-        const job = _thumbQueue.shift();
-        _thumbActive++;
+    while (_docThumbActive < 3 && _docThumbQueue.length) {
+        const job = _docThumbQueue.shift();
+        _docThumbActive++;
         fetch(DOCS_SCRIPT_URL, {
             method: 'POST',
             redirect: 'follow',
@@ -2149,19 +2476,66 @@ function thumbPump_() {
         .then(function (res) {
             const uri = res && res.success && res.data && res.data.dataUri;
             if (uri) {
-                _thumbCache[job.id] = uri;
+                _docThumbCache[job.id] = uri;
                 job.img.onerror = function () { thumbShowIcon_(job.img, job.icon); };
                 job.img.src = uri;
             } else thumbShowIcon_(job.img, job.icon);
         })
         .catch(function () { thumbShowIcon_(job.img, job.icon); })
-        .then(function () { _thumbActive--; thumbPump_(); });
+        .then(function () { _docThumbActive--; thumbPump_(); });
+    }
+}
+
+// ── VIDEOS pipeline (slow by design; cannot slow documents) ─────────────────
+var _vidThumbCache  = {};
+var _vidThumbQueue  = [];
+var _vidThumbActive = 0;
+
+function vidThumbFallback_(img, icon) {
+    img.onerror = null;
+    const id = img.getAttribute('data-thumb-id');
+    if (_vidThumbCache[id]) {
+        img.onerror = function () { thumbShowIcon_(img, icon); };
+        img.src = _vidThumbCache[id];
+        return;
+    }
+    _vidThumbQueue.push({ img: img, icon: icon, id: id });
+    vidThumbPump_();
+}
+
+function vidThumbPump_() {
+    while (_vidThumbActive < 3 && _vidThumbQueue.length) {
+        const job = _vidThumbQueue.shift();
+        _vidThumbActive++;
+        fetch(DOCS_SCRIPT_URL, {
+            method: 'POST',
+            redirect: 'follow',
+            headers: { "Content-Type": "text/plain;charset=utf-8" },
+            body: JSON.stringify({ action: 'GET_DOCUMENT_THUMBNAIL', file_id: job.id })
+        })
+        .then(function (r) { return r.json(); })
+        .then(function (res) {
+            const uri = res && res.success && res.data && res.data.dataUri;
+            if (uri) {
+                _vidThumbCache[job.id] = uri;
+                job.img.onerror = function () { thumbShowIcon_(job.img, job.icon); };
+                job.img.src = uri;
+            } else thumbShowIcon_(job.img, job.icon);
+        })
+        .catch(function () { thumbShowIcon_(job.img, job.icon); })
+        .then(function () { _vidThumbActive--; vidThumbPump_(); });
     }
 }
 
 async function renderDocuments() {
     // IMPORTANT: Uses DOCS_SCRIPT_URL (Gatekeeper) to fetch data
-    
+
+    // A visit to Videos may have left thumbnails queued on the video pump.
+    // Empty that queue so any leftover Gatekeeper work cannot contend with
+    // the document thumbnails this render is about to fire. In-flight video
+    // requests finish harmlessly on detached <img> elements.
+    _vidThumbQueue.length = 0;
+
     const container = document.getElementById("quiz-form");
     
     // Show skeleton grid while loading
@@ -2264,6 +2638,870 @@ async function renderDocuments() {
 
     } catch (e) {
         container.innerHTML = `<div style="text-align:center; padding:20px; color:#dc3545;"><h3>⚠️ Connection Error</h3><p>Could not load library.</p><button class="restart-button" onclick="renderDocuments()">Try Again</button></div>`;
+    }
+}
+
+// ============================================================
+// === COURSE VIDEOS (same Gatekeeper "Middle Man" as documents) ===
+// The video file stays PRIVATE in Drive. The Gatekeeper checks the student's code and scope and
+// sends the file in Base64 chunks (get_video_chunk).
+//  • Normal path: the service worker built into script.js turns those chunks into a seekable video stream,
+//    so playback starts after the first chunk while the rest keeps downloading ahead. Every
+//    chunk is also saved in Cache Storage, so a watched video plays offline (same local-expiry
+//    guard as PDFs).
+//  • Fallback (no service worker): download everything, save a Blob in
+//    IndexedDB, then play.
+// Both paths play in the same built-in player (_mountVideoPlayer) inside the viewer window.
+// ============================================================
+const _VID_MAX_BYTES = 250 * 1024 * 1024;   // fallback path only: refuse absurdly large files
+const _VID_CHUNK = 3 * 1024 * 1024;         // must match CHUNK in the worker block at the top
+const _VID_CACHE = 'kaeri-video-chunks-v1'; // must match CACHE in the worker block at the top
+let _vidObjUrl = null;
+let _vidReg = null;
+let _vidCurrentId = null;
+let _vidFailHandled = false;
+let _vidMsgBound = false;
+let _kvHideTimer = null;
+
+function _vidEsc(t) {
+    return String(t == null ? '' : t).replace(/[&<>"']/g, function (c) {
+        return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+}
+
+/** Stop the playing video, stop background saving and free memory. Called whenever the viewer resets or closes. */
+function _vidRelease() {
+    const closingId = _vidCurrentId;
+    _vidCurrentId = null;
+    if (_kvHideTimer) { clearTimeout(_kvHideTimer); _kvHideTimer = null; }
+    const v = document.querySelector('#pdf-canvas-container video');
+    if (v) { try { v.pause(); v.removeAttribute('src'); v.load(); } catch (e) {} }
+    if (_vidObjUrl) { try { URL.revokeObjectURL(_vidObjUrl); } catch (e) {} _vidObjUrl = null; }
+    try {
+        if (closingId && 'serviceWorker' in navigator && navigator.serviceWorker.controller) {
+            navigator.serviceWorker.controller.postMessage({ type: 'VID_STOP', id: closingId });
+        }
+    } catch (e) {}
+    try { if (screen.orientation && screen.orientation.unlock) screen.orientation.unlock(); } catch (e) {}
+}
+
+/** The Gatekeeper puts its reason code under data.code; accept either place. */
+function _vidDenied(res) {
+    const code = res && (res.code || (res.data && res.data.code));
+    _denyDocAccess(Object.assign({}, res || {}, { code: code }));
+}
+
+function openVideoByIndex(i) {
+    const v = (_videosCache[currentTermKey] || [])[i];
+    if (!v) return;
+    attemptOpenVideo(v.fileId, v.title);
+}
+
+async function renderVideos() {
+    const container = document.getElementById("quiz-form");
+
+    let skeletonHTML = `
+        <h2 style="text-align:center; margin-bottom:20px;">📺 Loading Videos...</h2>
+        <div style="display:grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap:15px; padding:20px 0;">
+    `;
+    for (let i = 0; i < 4; i++) {
+        skeletonHTML += `<div class="skeleton" style="height:180px; background:linear-gradient(90deg, #2b3a55 25%, #3e506e 50%, #2b3a55 75%); background-size:200% 100%; animation:shimmer 1.5s infinite; border-radius:10px;"></div>`;
+    }
+    skeletonHTML += `</div>`;
+    container.innerHTML = skeletonHTML;
+    document.getElementById("result").innerHTML = "";
+
+    currentQuizType = 'videos';
+    updateProgress(0, 0);
+
+    try {
+        let videos = await _fetchVideosForTerm(currentTermKey, currentCourse, currentTerm);
+        if (videos === null) videos = _videosCache[currentTermKey] || null;   // offline: last known list
+        if (videos === null) {
+            container.innerHTML = `<div style="text-align:center; padding:20px; color:#dc3545;"><h3>⚠️ Connection Error</h3><p>Could not load videos.</p><button class="restart-button" onclick="renderVideos()">Try Again</button> <button class="restart-button" onclick="exitQuiz()">Back to Menu</button></div>`;
+            return;
+        }
+        applyModeAvailability();
+
+        if (videos.length === 0) {
+            container.innerHTML = `<div style="text-align:center; padding:30px;"><h3>📺 No Videos Yet</h3><p>No videos uploaded for this term.</p><button class="restart-button" onclick="exitQuiz()">Back to Menu</button></div>`;
+            return;
+        }
+
+        let html = `<h2 style="text-align:center; margin-bottom:20px;">📺 ${_vidEsc(currentCourse)} Videos</h2>`;
+
+        if (!hasFullAccess) {
+            html += `
+                <div style="background:#2b3a55; border-left:6px solid #ffc107; padding:15px; border-radius:8px; margin-bottom:20px;">
+                    <p style="margin:0; color:#ffc107; font-weight:bold;">🔒 Preview Mode</p>
+                    <p style="margin:5px 0 0 0; font-size:0.9em;">Videos are visible but locked. Unlock Full Access to watch them.</p>
+                </div>`;
+        }
+
+        html += `<div style="display:grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap:15px; padding:20px 0;">`;
+
+        videos.forEach((vid, i) => {
+            const desc = String(vid.description || '');
+            const shortDesc = desc.length > 80 ? desc.substring(0, 80) + '...' : desc;
+            const lockIcon = hasFullAccess ? "▶️ Play" : "🔒 Locked";
+            const lockColor = hasFullAccess ? "#28a745" : "#dc3545";
+            const cardOpacity = hasFullAccess ? "1" : "0.75";
+
+            html += `
+            <div class="doc-card" onclick="openVideoByIndex(${i})"
+                 style="background:#2b3a55; padding:15px; border-radius:10px; border-left:5px solid ${lockColor};
+                        cursor:pointer; transition:0.3s; box-shadow: 0 4px 8px rgba(0,0,0,0.2); opacity:${cardOpacity};">
+
+                <div style="width:100%; height:140px; background:linear-gradient(135deg, #1b263b, #0d1b2a); border-radius:8px; margin-bottom:12px; overflow:hidden; display:flex; align-items:center; justify-content:center; border:1px solid #3e506e; position:relative;">
+                    <img src="https://drive.google.com/thumbnail?id=${_vidEsc(vid.fileId)}&sz=w400"
+                         data-thumb-id="${_vidEsc(vid.fileId)}"
+                         alt="${_vidEsc(vid.title)}"
+                         loading="lazy"
+                         style="width:100%; height:100%; object-fit:cover; transition:0.3s;"
+                         onerror="vidThumbFallback_(this, '🎥')">
+                    <div style="position:absolute; inset:0; display:flex; align-items:center; justify-content:center; pointer-events:none;">
+                        <span style="font-size:34px; color:#fff; background:rgba(0,0,0,0.55); width:56px; height:56px; border-radius:50%; display:flex; align-items:center; justify-content:center; padding-left:4px; box-sizing:border-box;">▶</span>
+                    </div>
+                    <div style="position:absolute; bottom:6px; right:8px; background:rgba(0,0,0,0.7); padding:2px 10px; border-radius:12px; font-size:9px; color:#fff; text-transform:uppercase; letter-spacing:0.5px;">VIDEO</div>
+                </div>
+
+                <div style="font-size:0.7em; text-transform:uppercase; color:${lockColor}; font-weight:bold; letter-spacing:1px; margin-bottom:5px;">${_vidEsc(vid.topic || 'General')}</div>
+                <div style="font-size:1.1em; font-weight:bold; color:white; margin-bottom:8px; line-height:1.3;">${_vidEsc(vid.title)}</div>
+                <div style="font-size:0.85em; color:#a0a8b4; margin-bottom:10px;">${_vidEsc(shortDesc)}</div>
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-top:10px; border-top:1px solid #3e506e; padding-top:10px;">
+                    <span style="background:#0d1b2a; padding:2px 8px; border-radius:4px; font-size:0.7em; color:#fff;">VIDEO • ${_vidEsc(vid.size || 'Unknown')}</span>
+                    <span style="color:${lockColor}; font-size:0.9em; font-weight:bold;">${lockIcon}</span>
+                </div>
+            </div>`;
+        });
+        html += `</div>`;
+        html += `<div style="text-align:center; margin-top:20px;"><button class="restart-button" onclick="exitQuiz()">⬅ Back to Menu</button></div>`;
+        container.innerHTML = html;
+
+    } catch (e) {
+        container.innerHTML = `<div style="text-align:center; padding:20px; color:#dc3545;"><h3>⚠️ Connection Error</h3><p>Could not load videos.</p><button class="restart-button" onclick="renderVideos()">Try Again</button></div>`;
+    }
+}
+
+// ── Service-worker glue ──────────────────────────────────────────────────────
+/** script.js is its own service worker: find this file's URL. */
+function _vidSwUrl() {
+    const me = document.currentScript && document.currentScript.src;
+    if (me) { _vidSwUrl._u = me; return me; }
+    if (_vidSwUrl._u) return _vidSwUrl._u;
+    const tags = document.querySelectorAll('script[src]');
+    for (let i = 0; i < tags.length; i++) {
+        if (/(^|\/)script\.js(\?|#|$)/.test(tags[i].getAttribute('src'))) return (_vidSwUrl._u = tags[i].src);
+    }
+    return (_vidSwUrl._u = new URL('script.js', location.href).href);
+}
+if (!_IS_SW && document.currentScript) _vidSwUrl._u = document.currentScript.src;
+
+/** Resolves once the given worker is activated; rejects when it fails or takes too long. */
+function _vidWaitActivated(sw, ms) {
+    return new Promise(function (resolve, reject) {
+        if (!sw) { reject(new Error('no worker')); return; }
+        if (sw.state === 'activated') { resolve(); return; }
+        const t = setTimeout(function () { reject(new Error('worker activation timed out')); }, ms);
+        sw.addEventListener('statechange', function () {
+            if (sw.state === 'activated') { clearTimeout(t); resolve(); }
+            else if (sw.state === 'redundant') { clearTimeout(t); reject(new Error('worker install failed')); }
+        });
+    });
+}
+
+async function _vidRegisterOnce() {
+    const swUrl = _vidSwUrl();
+    let reg = await navigator.serviceWorker.getRegistration();
+    const ours = reg && reg.active && reg.active.scriptURL.split('?')[0] === swUrl.split('?')[0];
+    if (!ours) {
+        if (!navigator.onLine) throw new Error('offline and worker not installed');
+        reg = await navigator.serviceWorker.register(swUrl, { updateViaCache: 'none' });
+    } else if (navigator.onLine) {
+        reg.update().catch(function () {});   // pick up fixes to script.js in the background
+    }
+    await _vidWaitActivated(reg.active || reg.waiting || reg.installing, 20000);
+    reg = (await navigator.serviceWorker.getRegistration()) || reg;
+    if (!navigator.serviceWorker.controller) {
+        // the page was opened before the worker existed: ask it to take control now
+        const target = reg.active;
+        const got = new Promise(function (res) {
+            const t = setTimeout(res, 6000);
+            navigator.serviceWorker.addEventListener('controllerchange', function () { clearTimeout(t); res(); }, { once: true });
+        });
+        if (target) target.postMessage({ type: 'VID_CLAIM' });
+        await got;
+    }
+    if (!navigator.serviceWorker.controller) throw new Error('worker is not controlling this page');
+    return reg;
+}
+
+async function _vidEnsureSW() {
+    if (!('serviceWorker' in navigator) || !('caches' in window) || !window.isSecureContext) return false;
+    let reg = null;
+    try {
+        try { reg = await _vidRegisterOnce(); }
+        catch (e1) {
+            console.warn('[VIDEO] worker start failed, retrying clean:', e1);
+            if (!navigator.onLine) throw e1;
+            const all = await navigator.serviceWorker.getRegistrations();
+            for (let k = 0; k < all.length; k++) { try { await all[k].unregister(); } catch (e) {} }
+            reg = await _vidRegisterOnce();
+        }
+        _vidReg = reg;
+        if (!_vidMsgBound) {
+            _vidMsgBound = true;
+            navigator.serviceWorker.addEventListener('message', function (ev) {
+                const d = ev.data || {};
+                if (!d.type || String(d.type).indexOf('VID_') !== 0 || d.id !== _vidCurrentId) return;
+                if (d.type === 'VID_FILL') _vidOnFill(d);
+                else if (d.type === 'VID_FAIL') _vidOnFail(d.reply);
+            });
+        }
+        return true;
+    } catch (e) {
+        console.warn('[VIDEO] service worker unavailable:', e);
+        return false;
+    }
+}
+
+function _vidKey(path) { return new URL(path, _vidReg.scope).href; }
+
+/** What is saved on this device for a video: { total, have, count } or null. */
+async function _vidSavedInfo(fileId) {
+    try {
+        const cache = await caches.open(_VID_CACHE);
+        const mr = await cache.match(_vidKey('__kmeta__/' + encodeURIComponent(fileId)));
+        if (!mr) return null;
+        const meta = await mr.json();
+        const prefix = _vidKey('__kchunk__/' + encodeURIComponent(fileId) + '/');
+        const have = (await cache.keys()).filter(function (r) { return r.url.indexOf(prefix) === 0; }).length;
+        return { total: meta.total, have: have, count: Math.ceil(meta.total / _VID_CHUNK) };
+    } catch (e) { return null; }
+}
+
+function _vidSendCtx(fileId, ctx) {
+    return new Promise(function (resolve) {
+        try {
+            const ch = new MessageChannel();
+            const t = setTimeout(function () { resolve(false); }, 2000);
+            ch.port1.onmessage = function () { clearTimeout(t); resolve(true); };
+            navigator.serviceWorker.controller.postMessage({ type: 'VID_CTX', id: fileId, ctx: ctx }, [ch.port2]);
+        } catch (e) { resolve(false); }
+    });
+}
+
+function _vidOnFill(d) {
+    const el = document.querySelector('#pdf-canvas-container .kv-save');
+    if (!d.count) return;
+    if (d.done >= d.count) {
+        if (el) { el.textContent = '✅ Saved offline'; el.title = 'This video plays without internet'; }
+        if (!_vidOnFill.toasted || _vidOnFill.toasted !== d.id) {
+            _vidOnFill.toasted = d.id;
+            showAppNotification("✅ Saved. This video now plays offline.", "info", 2500);
+            _ensurePersistentStorage().then(function (persisted) { if (!persisted) setTimeout(_offlineTipOnce, 3000); });
+        }
+    } else if (el) {
+        el.textContent = '⬇ ' + Math.floor((d.done / d.count) * 100) + '%';
+        el.title = 'Saving for offline use';
+    }
+}
+
+function _vidOnFail(reply) {
+    if (_vidFailHandled || !_vidCurrentId) return;
+    const code = reply && (reply.code || (reply.data && reply.data.code));
+    if (_isDefinitiveDenial(reply) || code === 'DRIVE_UNAVAILABLE') {
+        _vidFailHandled = true;
+        _vidDenied(reply);
+    }
+    // anything else: the player shows its own "Tap to retry" message when the stream breaks
+}
+
+// ── Built-in player (no external library) ────────────────────────────────────
+function _kvInjectStyle() {
+    if (document.getElementById('kv-style')) return;
+    const st = document.createElement('style');
+    st.id = 'kv-style';
+    st.textContent = `
+    /* ===== Wrapper ===== */
+    .kv-wrap { position:relative; width:100%; background:#0d1b2a; border-radius:8px; overflow:hidden;
+               user-select:none; -webkit-user-select:none; outline:none;
+               font-family:inherit; display:flex; flex-direction:column; }
+    html.kv-lock, html.kv-lock body { overflow:hidden; }
+
+    /* ===== Stage (the video area) ===== */
+    .kv-stage { position:relative; background:#000; min-height:200px; }
+    .kv-stage video { display:block; width:100%; max-height:70vh; background:#000; vertical-align:bottom; }
+
+    /* Center play button + spinner (the only non-bar overlay on the video) */
+    .kv-center { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; pointer-events:none; }
+    .kv-big { pointer-events:auto; width:68px; height:68px; border-radius:50%; border:0;
+              background:rgba(13,27,42,.7); color:#fff; font-size:28px; line-height:1;
+              display:flex; align-items:center; justify-content:center; cursor:pointer;
+              padding:0 0 0 4px; backdrop-filter:blur(8px);
+              transition:transform .15s, background .15s; }
+    .kv-big:hover { background:rgba(114,239,221,.9); color:#0d1b2a; transform:scale(1.05); }
+    .kv-spin { position:absolute; width:46px; height:46px;
+               border:4px solid rgba(255,255,255,.25); border-top-color:#72efdd;
+               border-radius:50%; animation:kvspin .8s linear infinite; }
+    @keyframes kvspin { to { transform:rotate(360deg); } }
+
+    /* ===== Seek bar — the ONLY overlay on the video ===== */
+    .kv-progress { position:absolute; left:0; right:0; bottom:0; height:24px;
+                   display:flex; align-items:flex-end; padding:0;
+                   transition:height .15s ease, background .15s ease; cursor:pointer; }
+    .kv-progress:hover { height:34px; background:linear-gradient(transparent,rgba(0,0,0,.35)); }
+    .kv-track { position:relative; width:100%; height:4px; background:rgba(255,255,255,.2);
+                transition:height .12s ease; }
+    .kv-progress:hover .kv-track { height:6px; }
+    .kv-buf    { position:absolute; left:0; top:0; bottom:0; width:0;
+                 background:rgba(255,255,255,.4); transition:width .2s; }
+    .kv-played { position:absolute; left:0; top:0; bottom:0; width:0;
+                 background:#72efdd; transition:width .08s; }
+    .kv-range  { position:absolute; inset:0; width:100%; height:100%; margin:0; padding:0;
+                 background:transparent; -webkit-appearance:none; appearance:none;
+                 cursor:pointer; opacity:0; }
+
+    /* ===== Controls BELOW the video ===== */
+    .kv-controls { display:flex; align-items:center; gap:4px; padding:10px 12px;
+                   background:#0d1b2a; border-top:1px solid #2b3a55; color:#e0e6ed;
+                   flex-wrap:wrap; justify-content:center; transition:opacity .25s; }
+    .kv-btn { background:transparent; border:0; color:#e0e6ed; height:40px; min-width:40px;
+              padding:0 10px; border-radius:8px; font-size:15px; font-weight:600;
+              cursor:pointer; display:inline-flex; align-items:center; justify-content:center;
+              transition:background .15s, color .15s, transform .1s; font-family:inherit;
+              line-height:1; box-shadow:none; margin:0; }
+    .kv-btn:hover        { background:rgba(114,239,221,.12); color:#72efdd; }
+    .kv-btn:active       { background:rgba(114,239,221,.22); transform:scale(.96); }
+    .kv-btn.kv-primary   { background:#72efdd; color:#0d1b2a; width:44px; height:44px;
+                           border-radius:50%; padding:0; font-size:16px; }
+    .kv-btn.kv-primary:hover  { background:#5ddcce; color:#0d1b2a; }
+    .kv-btn.kv-primary:active { transform:scale(.94); }
+    .kv-btn.kv-txt       { font-size:12px; min-width:46px; padding:0 6px; letter-spacing:.3px; }
+    .kv-time { flex:1; text-align:center; font-size:13px; color:#a0a8b4;
+               font-variant-numeric:tabular-nums; white-space:nowrap; padding:0 8px; min-width:90px; }
+    .kv-save { font-size:11px; color:#72efdd; padding:0 6px; white-space:nowrap; font-weight:600; }
+
+    /* Error message overlay */
+    .kv-msg { position:absolute; inset:0; display:none; flex-direction:column; align-items:center;
+              justify-content:center; gap:12px; background:rgba(13,27,42,.85); color:#fff;
+              text-align:center; padding:20px; font-size:15px; backdrop-filter:blur(4px); }
+    .kv-msg button { background:#72efdd; color:#0d1b2a; border:0; border-radius:8px;
+                     padding:10px 20px; font-weight:700; cursor:pointer; font-size:15px; }
+    .kv-msg button:hover { background:#5ddcce; }
+
+    /* ===== FULLSCREEN — controls become an overlay (there is no "below" in fullscreen) ===== */
+    .kv-wrap:fullscreen, .kv-wrap.kv-max {
+        position:fixed; inset:0; width:100vw; height:100vh; height:100dvh;
+        z-index:2147483000; border-radius:0; background:#000;
+    }
+    .kv-wrap:-webkit-full-screen { width:100%; height:100%; border-radius:0; background:#000; }
+    .kv-wrap:fullscreen .kv-stage, .kv-wrap.kv-max .kv-stage {
+        flex:1; min-height:0; height:100%; display:flex; align-items:center; justify-content:center;
+    }
+    .kv-wrap:-webkit-full-screen .kv-stage { flex:1; min-height:0; height:100%; display:flex; align-items:center; justify-content:center; }
+    .kv-wrap:fullscreen .kv-stage video, .kv-wrap.kv-max .kv-stage video {
+        width:100%; height:100%; max-height:none; object-fit:contain;
+    }
+    .kv-wrap:-webkit-full-screen .kv-stage video { width:100%; height:100%; max-height:none; object-fit:contain; }
+    .kv-wrap:fullscreen .kv-controls, .kv-wrap.kv-max .kv-controls {
+        position:absolute; left:0; right:0; bottom:28px;
+        background:linear-gradient(transparent, rgba(0,0,0,.85));
+        border-top:none; padding:24px 16px 10px; flex-wrap:nowrap;
+    }
+    .kv-wrap:-webkit-full-screen .kv-controls {
+        position:absolute; left:0; right:0; bottom:28px;
+        background:linear-gradient(transparent, rgba(0,0,0,.85));
+        border-top:none; padding:24px 16px 10px; flex-wrap:nowrap;
+    }
+    /* Rotated-landscape fallback: used on touch devices that cannot lock the screen orientation
+       (iPhone Safari, in-app browsers). The maximized player is turned 90deg so the video fills
+       the phone held upright; it un-rotates the moment the phone is physically turned sideways. */
+    .kv-wrap.kv-max.kv-rot, .kv-wrap:fullscreen.kv-rot {
+        inset:auto; top:0; left:100vw; right:auto; bottom:auto;
+        width:100vh; width:100dvh; height:100vw; height:100dvw;
+        transform-origin:0 0; transform:rotate(90deg);
+    }
+    .kv-wrap:fullscreen.kv-hide .kv-controls,
+    .kv-wrap.kv-max.kv-hide .kv-controls        { opacity:0; pointer-events:none; }
+    .kv-wrap:fullscreen.kv-hide .kv-progress,
+    .kv-wrap.kv-max.kv-hide .kv-progress        { opacity:0; }
+    .kv-wrap:fullscreen.kv-hide, .kv-wrap.kv-max.kv-hide { cursor:none; }
+
+    /* ===== Mobile ===== */
+    @media (max-width:480px) {
+        .kv-controls { padding:8px 6px; gap:2px; }
+        .kv-btn { height:38px; min-width:38px; padding:0 6px; font-size:14px; }
+        .kv-btn.kv-txt { font-size:11px; min-width:40px; }
+        .kv-btn.kv-primary { width:42px; height:42px; font-size:15px; }
+        .kv-time { font-size:12px; min-width:80px; padding:0 4px; }
+        .kv-save { font-size:10px; padding:0 4px; }
+    }
+    `;
+    document.head.appendChild(st);
+}
+
+function _kvFmt(s) {
+    if (!isFinite(s) || s < 0) s = 0;
+    s = Math.floor(s);
+    const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), x = s % 60;
+    return (h ? h + ':' + String(m).padStart(2, '0') : m) + ':' + String(x).padStart(2, '0');
+}
+
+/** Put a video on screen with the built-in controls. src = stream URL or blob URL. */
+function _mountVideoPlayer(src, title, opts) {
+    opts = opts || {};
+    const container = document.getElementById('pdf-canvas-container');
+    const loader = document.getElementById('doc-loader-overlay');
+    if (!container) return null;
+    _kvInjectStyle();
+    container.innerHTML = '';
+    if (typeof _docProgressStop === 'function') { try { _docProgressStop(); } catch (e) {} }
+
+    const wrap = document.createElement('div');
+    wrap.className = 'kv-wrap';
+    wrap.tabIndex = 0;
+    wrap.innerHTML = `
+        <div class="kv-stage">
+            <video playsinline webkit-playsinline preload="auto" disablepictureinpicture controlslist="nodownload noremoteplayback"></video>
+            <div class="kv-center"><div class="kv-spin"></div><button type="button" class="kv-big" aria-label="Play">▶</button></div>
+            <div class="kv-progress">
+                <div class="kv-track"><div class="kv-buf"></div><div class="kv-played"></div></div>
+                <input class="kv-range" type="range" min="0" max="1000" value="0" step="1" aria-label="Seek">
+            </div>
+            <div class="kv-msg"><div class="kv-msg-text"></div><button type="button">Try again</button></div>
+        </div>
+        <div class="kv-controls" role="group" aria-label="Video controls">
+            <button type="button" class="kv-btn kv-primary" data-k="play" aria-label="Play or pause">▶</button>
+            <button type="button" class="kv-btn kv-txt" data-k="back" aria-label="Back 10 seconds">−10s</button>
+            <button type="button" class="kv-btn kv-txt" data-k="fwd"  aria-label="Forward 10 seconds">+10s</button>
+            <span class="kv-time">0:00 / 0:00</span>
+            <span class="kv-save"></span>
+            <button type="button" class="kv-btn kv-txt" data-k="speed" aria-label="Playback speed">1×</button>
+            <button type="button" class="kv-btn" data-k="mute" aria-label="Mute">🔊</button>
+            <button type="button" class="kv-btn" data-k="fs"   aria-label="Fullscreen" title="Fullscreen">⤢</button>
+        </div>`;
+
+    const v = wrap.querySelector('video');
+    const q = function (sel) { return wrap.querySelector(sel); };
+    const big = q('.kv-big'), spin = q('.kv-spin'), range = q('.kv-range'), bufEl = q('.kv-buf'),
+          playedEl = q('.kv-played'), timeEl = q('.kv-time'), saveEl = q('.kv-save'), msgEl = q('.kv-msg');
+    const btn = function (k) { return wrap.querySelector('[data-k="' + k + '"]'); };
+    let dragging = false, started = false;
+    const rates = [1, 1.25, 1.5, 2, 0.75];
+    let rateIdx = 0;
+
+    if (opts.savedFull) saveEl.textContent = '✅ Saved offline';
+
+    const dur = function () { return isFinite(v.duration) ? v.duration : 0; };
+    function refresh() {
+        const d = dur(), t = v.currentTime || 0;
+        if (!dragging) timeEl.textContent = _kvFmt(t) + ' / ' + _kvFmt(d);
+        playedEl.style.width = (d ? (t / d) * 100 : 0) + '%';
+        if (!dragging) range.value = d ? Math.round((t / d) * 1000) : 0;
+        let buffEnd = 0;
+        for (let i = 0; i < v.buffered.length; i++) {
+            if (v.buffered.start(i) <= t + 0.5 && v.buffered.end(i) >= t) { buffEnd = v.buffered.end(i); break; }
+        }
+        bufEl.style.width = (d ? Math.min(100, (buffEnd / d) * 100) : 0) + '%';
+    }
+    function syncPlay() {
+        const playing = !v.paused && !v.ended;
+        btn('play').textContent = playing ? '⏸' : '▶';
+        big.textContent = v.ended ? '↻' : '▶';
+        big.style.display = playing ? 'none' : 'flex';
+    }
+    function isMax() {
+        const d = document;
+        return !!(d.fullscreenElement || d.webkitFullscreenElement) || wrap.classList.contains('kv-max');
+    }
+    // Auto-hide is a FULLSCREEN-ONLY behaviour: in normal mode the controls live
+    // below the video and must stay visible.
+    function showControls() {
+        wrap.classList.remove('kv-hide');
+        if (_kvHideTimer) clearTimeout(_kvHideTimer);
+        if (!v.paused && !v.ended && isMax()) {
+            _kvHideTimer = setTimeout(function () { wrap.classList.add('kv-hide'); }, 3000);
+        }
+    }
+    function play()   { const p = v.play(); if (p && p.catch) p.catch(function () {}); }
+    function toggle() { if (v.ended) v.currentTime = 0; if (v.paused) play(); else v.pause(); }
+    function skip(d)  { const t = (v.currentTime || 0) + d; v.currentTime = Math.max(0, dur() ? Math.min(dur(), t) : t); showControls(); }
+
+    // ── Orientation: maximize turns the screen to landscape, minimize turns it back ──
+    // 1) Real screen lock (Android Chrome etc.) works only inside true fullscreen.
+    // 2) Where that is unavailable or refused (iPhone Safari, CSS-maximized fallback) a touch device
+    //    held upright gets a CSS-rotated player (.kv-rot) instead, so the result looks the same.
+    let orientLocked = false;
+    function applyRot() {
+        if (!wrap.isConnected) {
+            window.removeEventListener('resize', applyRot);
+            window.removeEventListener('orientationchange', applyRot);
+            return;
+        }
+        let touch = false, portrait = window.innerHeight > window.innerWidth;
+        try { touch = window.matchMedia('(pointer: coarse)').matches; } catch (e) {}
+        wrap.classList.toggle('kv-rot', isMax() && touch && portrait && !orientLocked);
+    }
+    function lockLandscape() {
+        let p = null;
+        try { if (screen.orientation && screen.orientation.lock) p = screen.orientation.lock('landscape'); } catch (e) { p = null; }
+        if (!p || !p.then) { orientLocked = false; applyRot(); return; }
+        p.then(function () { orientLocked = true; applyRot(); })
+         .catch(function () { orientLocked = false; applyRot(); });
+    }
+    function unlockOrientation() {
+        orientLocked = false;
+        try { if (screen.orientation && screen.orientation.unlock) screen.orientation.unlock(); } catch (e) {}
+        wrap.classList.remove('kv-rot');
+    }
+    window.addEventListener('resize', applyRot);
+    window.addEventListener('orientationchange', applyRot);
+
+    function syncMax() {
+        const m = isMax(), b = btn('fs');
+        if (!b) return;
+        b.textContent = m ? '⤡' : '⤢';
+        b.setAttribute('aria-label', m ? 'Minimize' : 'Fullscreen');
+        b.title = m ? 'Minimize' : 'Fullscreen';
+        if (!m && wrap.isConnected) unlockOrientation();   // left fullscreen (button, Esc or system gesture): turn back
+    }
+    function toggleFs() {
+        const d = document, fsEl = d.fullscreenElement || d.webkitFullscreenElement;
+        if (fsEl) { (d.exitFullscreen || d.webkitExitFullscreen).call(d); return; }
+        if (wrap.classList.contains('kv-max')) {              // minimize the CSS-maximized fallback
+            wrap.classList.remove('kv-max');
+            d.documentElement.classList.remove('kv-lock');
+            unlockOrientation();
+            syncMax();
+            return;
+        }
+        let p;
+        const cssMax = function () {
+            // Own maximized layout (keeps OUR controls and the minimize button) + landscape.
+            wrap.classList.add('kv-max');
+            d.documentElement.classList.add('kv-lock');
+            syncMax();
+            lockLandscape();          // refused outside real fullscreen -> rotated fallback takes over
+        };
+        try {
+            if (wrap.requestFullscreen) p = wrap.requestFullscreen();
+            else if (wrap.webkitRequestFullscreen) p = wrap.webkitRequestFullscreen();
+            else { cssMax(); return; }
+        } catch (e) { cssMax(); return; }
+        Promise.resolve(p).then(lockLandscape).catch(cssMax);
+    }
+    document.addEventListener('fullscreenchange', syncMax);
+    document.addEventListener('webkitfullscreenchange', syncMax);
+
+    function showError(text) {
+        spin.style.display = 'none';
+        q('.kv-msg-text').textContent = text;
+        msgEl.style.display = 'flex';
+    }
+
+    big.onclick      = toggle;
+    btn('play').onclick  = toggle;
+    btn('back').onclick  = function () { skip(-10); };
+    btn('fwd').onclick   = function () { skip(10); };
+    btn('speed').onclick = function () {
+        rateIdx = (rateIdx + 1) % rates.length;
+        v.playbackRate = rates[rateIdx];
+        btn('speed').textContent = rates[rateIdx] + '×';
+        showControls();
+    };
+    btn('mute').onclick  = function () { v.muted = !v.muted; btn('mute').textContent = v.muted ? '🔇' : '🔊'; showControls(); };
+    btn('fs').onclick    = toggleFs;
+
+    // Clicking the video: in fullscreen-with-hidden-controls the first tap restores
+    // the controls; otherwise it toggles play. In normal mode the cursor is fine.
+    v.addEventListener('click', function () {
+        if (isMax() && wrap.classList.contains('kv-hide')) { showControls(); return; }
+        toggle();
+    });
+    v.addEventListener('dblclick', toggleFs);
+    v.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+
+    range.addEventListener('input', function () {
+        dragging = true;
+        const d = dur();
+        if (d) timeEl.textContent = _kvFmt((range.value / 1000) * d) + ' / ' + _kvFmt(d);
+        showControls();
+    });
+    range.addEventListener('change', function () {
+        const d = dur();
+        if (d) { v.currentTime = (range.value / 1000) * d; spin.style.display = 'block'; }
+        dragging = false;
+    });
+    wrap.addEventListener('keydown', function (e) {
+        const k = e.key;
+        if (k === ' ' || k === 'k') { e.preventDefault(); toggle(); }
+        else if (k === 'ArrowLeft') { e.preventDefault(); skip(-5); }
+        else if (k === 'ArrowRight') { e.preventDefault(); skip(5); }
+        else if (k === 'f') { e.preventDefault(); toggleFs(); }
+        else if (k === 'm') { e.preventDefault(); btn('mute').click(); }
+    });
+    wrap.addEventListener('pointermove', showControls);
+    wrap.addEventListener('touchstart', showControls, { passive: true });
+
+    ['timeupdate', 'progress', 'durationchange', 'loadedmetadata', 'seeked'].forEach(function (ev) { v.addEventListener(ev, refresh); });
+    ['play', 'pause', 'ended'].forEach(function (ev) { v.addEventListener(ev, function () { syncPlay(); showControls(); }); });
+    v.addEventListener('waiting', function () { spin.style.display = 'block'; });
+    ['playing', 'canplay', 'seeked'].forEach(function (ev) { v.addEventListener(ev, function () { spin.style.display = 'none'; }); });
+    v.addEventListener('playing', function () {
+        if (started) return;
+        started = true;
+        logAnalyticsEvent('video_view', `Watched: ${title}`);
+        if (opts.onFirstPlay) opts.onFirstPlay();
+    });
+    v.addEventListener('error', function () {
+        if (!v.getAttribute('src') || !_vidCurrentId) return;   // the viewer is closing: ignore
+        showError('⚠️ Connection problem. The video stopped loading.');
+    });
+    msgEl.querySelector('button').onclick = function () {
+        const t = v.currentTime || 0;
+        msgEl.style.display = 'none';
+        spin.style.display = 'block';
+        v.src = src;
+        v.load();
+        v.addEventListener('loadedmetadata', function once() {
+            v.removeEventListener('loadedmetadata', once);
+            try { v.currentTime = t; } catch (e) {}
+            play();
+        });
+    };
+
+    container.appendChild(wrap);
+    if (loader) loader.style.display = 'none';
+    spin.style.display = 'block';
+    syncPlay();
+    v.src = src;
+    v.load();
+    play();                                   // autoplay may be blocked: the big ▶ stays on screen
+    try { wrap.focus({ preventScroll: true }); } catch (e) {}
+    return v;
+}
+
+/** Fallback path: play a finished Blob. */
+function _playVideoBlob(blob, title) {
+    _vidRelease();
+    _vidObjUrl = URL.createObjectURL(blob);
+    _mountVideoPlayer(_vidObjUrl, title, { savedFull: true });
+}
+
+/** Normal path: stream through the built-in service worker. Returns false when the worker could not be primed. */
+async function _playVideoStream(fileId, title, sessionPayload, offline) {
+    const ctx = { u: APPS_SCRIPT_URL, c: sessionPayload.code, e: sessionPayload.email, d: sessionPayload.device_fp };
+    if (!(await _vidSendCtx(fileId, ctx))) return false;
+    if (_vidCurrentId !== fileId) return true;   // closed while preparing
+    const src = new URL('__kvid__/' + encodeURIComponent(fileId) + '.mp4', _vidReg.scope).href;
+    const info = await _vidSavedInfo(fileId);
+    const complete = !!(info && info.count && info.have >= info.count);
+    _mountVideoPlayer(src, title, {
+        savedFull: complete,
+        onFirstPlay: function () {
+            // keep downloading ahead (and saving) while the student watches
+            if (!offline && !complete && navigator.serviceWorker.controller) {
+                navigator.serviceWorker.controller.postMessage({ type: 'VID_FILL', id: fileId });
+            }
+        }
+    });
+    return true;
+}
+
+/**
+ * Download a video through the Gatekeeper in chunks (first chunk alone, the rest 3 at a time).
+ * Returns { success:true, blob } or the Gatekeeper's failure reply. Throws AbortError when cancelled.
+ */
+async function _downloadVideoChunks(fileId, sessionPayload, signal) {
+    const CHUNK = 3 * 1024 * 1024, PARALLEL = 3, RETRIES = 3;
+
+    async function fetchChunk(start) {
+        let last = null;
+        for (let a = 0; a < RETRIES; a++) {
+            if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
+            try {
+                const res = await fetch(APPS_SCRIPT_URL, {
+                    method: 'POST',
+                    headers: { "Content-Type": "text/plain;charset=utf-8" },
+                    body: JSON.stringify({ action: 'get_video_chunk', file_id: fileId, start: start, length: CHUNK, session: sessionPayload }),
+                    signal: signal
+                });
+                const j = await res.json();
+                if (j && j.success && j.data && typeof j.data.base64 === 'string') return j;
+                last = j;
+                const code = j && (j.code || (j.data && j.data.code));
+                if (_isDefinitiveDenial(j) || code === 'DRIVE_UNAVAILABLE') return j;   // retrying will not change the answer
+            } catch (e) {
+                if (e && e.name === 'AbortError') throw e;
+                last = { success: false, message: 'Network error' };
+            }
+            await new Promise(function (r) { setTimeout(r, 800 * (a + 1)); });
+        }
+        return last || { success: false, message: 'Download failed' };
+    }
+
+    _docProgressStart();
+    const first = await fetchChunk(0);
+    if (!(first && first.success && first.data)) return first;
+
+    const total = first.data.total;
+    if (!total || total > _VID_MAX_BYTES) return { success: false, message: 'Video unavailable: file is too large for this device.' };
+    const mime = first.data.mimeType || 'video/mp4';
+    const count = Math.ceil(total / CHUNK);
+    const parts = new Array(count);
+
+    _docProg.total = total;
+    _docProg.stage = 'transfer';
+    function keep(i, b64) {
+        const bytes = _b64ToBytes(b64);
+        parts[i] = bytes;
+        _docProg.got += bytes.length;
+    }
+    keep(0, first.data.base64);
+
+    let next = 1, failure = null;
+    async function worker() {
+        while (!failure) {
+            const i = next++;
+            if (i >= count) return;
+            const r = await fetchChunk(i * CHUNK);
+            if (!(r && r.success && r.data)) { failure = r || { success: false, message: 'Download failed' }; return; }
+            keep(i, r.data.base64);
+        }
+    }
+    const workers = [];
+    for (let w = 0; w < Math.min(PARALLEL, count - 1); w++) workers.push(worker());
+    await Promise.all(workers);
+    if (failure) return failure;
+
+    let got = 0;
+    for (let i = 0; i < count; i++) { if (!parts[i]) return { success: false, message: 'Download incomplete' }; got += parts[i].length; }
+    if (got !== total) return { success: false, message: 'Download incomplete. Please try again.' };
+
+    return { success: true, blob: new Blob(parts, { type: mime }) };
+}
+
+/** Server check before a saved copy is used. true = go ahead; false = the UI was already handled. */
+async function _vidVerifyOnline(fileId, sessionPayload) {
+    const lt = document.getElementById('doc-loader-text');
+    if (lt) lt.textContent = 'Verifying access...';
+    let allowed = false, timedOut = false;
+    const vctl = new AbortController();
+    _docAbort = vctl;
+    const vtimer = setTimeout(() => { timedOut = true; vctl.abort(); }, 8000);
+    try {
+        const vres = await fetch(APPS_SCRIPT_URL, {
+            method: 'POST',
+            headers: { "Content-Type": "text/plain;charset=utf-8" },
+            body: JSON.stringify({ action: 'verify_video_access', file_id: fileId, session: sessionPayload }),
+            signal: vctl.signal
+        });
+        const vdata = await vres.json();
+        if (vdata.success) allowed = true;
+        else if (_isDefinitiveDenial(vdata)) { _vidDenied(vdata); return false; }
+        else allowed = _localExpiryValid();
+    } catch (e) {
+        if (e && e.name === 'AbortError' && !timedOut) return false;      // the student closed the viewer
+        allowed = _localExpiryValid();
+    } finally { clearTimeout(vtimer); }
+    if (!allowed) {
+        closeDocViewer();
+        showAppNotification("⏳ Session expired. Connect to internet to verify.", "warning");
+        return false;
+    }
+    return true;
+}
+
+/** Fallback path: download everything first, save a Blob, then play. */
+async function _vidDownloadThenPlay(fileId, title, sessionPayload, key) {
+    const lt = () => document.getElementById('doc-loader-text');
+    const _vMeta = (_videosCache[currentTermKey] || []).find(x => String(x.fileId) === String(fileId));
+    const _vSize = _vMeta && _vMeta.size ? ' (' + _vMeta.size + ')' : '';
+    if (lt()) lt().textContent = 'Downloading securely' + _vSize + '. Keep this window open: the video plays when the download finishes and is saved for offline use.';
+    _docAbort = new AbortController();
+    const myAbort = _docAbort;
+    const result = await _downloadVideoChunks(fileId, sessionPayload, myAbort.signal);
+    if (myAbort.signal.aborted) return;   // viewer closed / another file opened meanwhile
+
+    if (result && result.success && result.blob) {
+        _docProgressFinish();
+        _playVideoBlob(result.blob, title);
+        const saved = await saveDocOffline(key, result.blob);
+        const quota = !saved && _lastOfflineError && (_lastOfflineError.name === 'QuotaExceededError' || /quota/i.test(String(_lastOfflineError.message || '')));
+        if (saved) {
+            const persisted = await _ensurePersistentStorage();
+            showAppNotification("✅ Saved. This video now plays offline.", "info", 2500);
+            if (!persisted) setTimeout(_offlineTipOnce, 3000);
+        } else {
+            showAppNotification(quota
+                ? "⚠️ Your phone is low on storage, so this video could not be saved for offline use."
+                : "⚠️ This video could not be saved for offline use. It will download again next time.", "warning", 6000);
+        }
+    } else {
+        _vidDenied(result);
+    }
+}
+
+// Video access bouncer — same order as documents: instant viewer, local expiry when offline,
+// server check before any saved copy is used, then stream (or download) through the Gatekeeper.
+async function attemptOpenVideo(fileId, title) {
+    if (!hasFullAccess) {
+        showAppNotification("⚠️ Videos are only accessible in Full Access mode.", "warning", 2500);
+        setTimeout(() => { openPaymentModal(); }, 1000);
+        return;
+    }
+
+    const key = 'vid_' + fileId;
+    const sessionPayload = { code: userCode, email: userEmail, device_fp: deviceFP || localStorage.getItem('device_fp') || 'unknown' };
+    const loaderText = () => document.getElementById('doc-loader-text');
+
+    showDocViewerLoading(title);
+    _vidCurrentId = fileId;
+    _vidFailHandled = false;
+    if (loaderText()) loaderText().textContent = 'Preparing video...';
+
+    const swReady = await _vidEnsureSW();
+    if (_vidCurrentId !== fileId) return;   // the student closed the viewer or opened another video
+
+    // ── OFFLINE: local expiry check, then a saved copy ──
+    if (!navigator.onLine) {
+        if (!_localExpiryValid()) {
+            closeDocViewer();
+            showAppNotification("⏳ Session expired. Connect to internet to verify.", "warning");
+            return;
+        }
+        const legacy = await getOfflineDoc(key);
+        if (legacy instanceof Blob) { _playVideoBlob(legacy, title); return; }
+        const info = swReady ? await _vidSavedInfo(fileId) : null;
+        if (info && info.count && info.have >= info.count && await _playVideoStream(fileId, title, sessionPayload, true)) return;
+        closeDocViewer();
+        showAppNotification("📡 You are offline and haven't saved this video yet.", "warning");
+        return;
+    }
+
+    try {
+        // ── ONLINE with something already saved: the server must still say yes ──
+        const legacy = await getOfflineDoc(key);
+        const info = swReady ? await _vidSavedInfo(fileId) : null;
+        if (legacy instanceof Blob || info) {
+            if (!(await _vidVerifyOnline(fileId, sessionPayload))) return;
+            if (_vidCurrentId !== fileId) return;
+            if (legacy instanceof Blob) { _playVideoBlob(legacy, title); return; }
+        }
+
+        // ── ONLINE: stream through the Gatekeeper (it checks access on the first chunk) ──
+        if (swReady && await _playVideoStream(fileId, title, sessionPayload, false)) return;
+
+        // ── The streaming player could not start: no download screen, just say why ──
+        closeDocViewer();
+        showAppNotification(swReady
+            ? "⚠️ Could not start the video. Check your connection and try again."
+            : "⚠️ Video player is still starting. Please refresh the page once (needs HTTPS) and open the video again.", "error", 6000);
+    } catch (e) {
+        if (e && e.name === 'AbortError') return;   // the student cancelled / closed the viewer
+        closeDocViewer();
+        showAppNotification("⚠️ Connection error. Could not load the video.", "error");
     }
 }
 
@@ -2462,6 +3700,14 @@ function handleSessionExpired(message) {
     // Halt any document currently on screen and delete all offline copies
     closeDocViewer();
     clearOfflineDocs();
+    // Drop the in-memory lists and the saved video list, then reload them for the demo view
+    Object.keys(_docsCache).forEach(function (k) { delete _docsCache[k]; });
+    Object.keys(_videosCache).forEach(function (k) { delete _videosCache[k]; });
+    try { localStorage.removeItem('kaeri_videos_' + currentTermKey); } catch (e) {}
+    if (currentCourse && currentTerm) {
+        _loadDocsAvailability(currentTermKey, currentCourse, currentTerm);
+        _loadVideosAvailability(currentTermKey, currentCourse, currentTerm);
+    }
     enableDemoUI();
     showAppNotification(`⏳ ${message || 'Session expired. Please log in again.'}`, 'warning');
 }
@@ -7590,7 +8836,7 @@ function _handleEscapeBack(e) {
 
     switch (currentQuizType) {
         case 'mcq': case 'shortAnswer': case 'essay':
-        case 'mcqMenu': case 'essayMenu': case 'dashboard': case 'documents':
+        case 'mcqMenu': case 'essayMenu': case 'dashboard': case 'documents': case 'videos':
             e.preventDefault(); exitQuiz(); return;
         case 'mcqDemoUnit':
             e.preventDefault(); exitQuiz(); return;
@@ -7617,6 +8863,8 @@ document.addEventListener("keydown", (e) => {
     const typing = _isTypingTarget(e.target);
 
     if (e.key === "Escape") {
+        const maxed = document.querySelector('.kv-wrap.kv-max');
+        if (maxed) { const fb = maxed.querySelector('[data-k="fs"]'); if (fb) fb.click(); return; }
         const modalWasOpen = _anyModalOpen();
         closePaymentModal();
         closePrintPreview();
