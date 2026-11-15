@@ -1332,15 +1332,83 @@ function renderMath(targetId = null) {
 
 function injectDocViewerHTML() {
     if (document.getElementById('smart-doc-viewer')) return;
-    
+
     const viewerHTML = `
-    <div id="smart-doc-viewer" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.95); z-index:9999; align-items:center; justify-content:center; backdrop-filter:blur(5px);">
-        <div style="background:#1a1a2e; width:95%; height:95%; border-radius:15px; padding:0; display:flex; flex-direction:column; box-shadow:0 10px 40px rgba(0,0,0,0.5); border:2px solid #72efdd; overflow:hidden; position:relative;">
-            
+    <div id="smart-doc-viewer" style="display:none;">
+        <style>
+            /* ---- Document viewer layout (portrait = framed card, landscape = true full screen) ---- */
+            #smart-doc-viewer { position:fixed; top:0; left:0; right:0; bottom:0; width:100%; height:100%; height:100dvh; background:rgba(0,0,0,0.95); z-index:9999; align-items:center; justify-content:center; backdrop-filter:blur(5px); }
+            #smart-doc-viewer .dv-box { background:#1a1a2e; width:95%; height:95%; border-radius:15px; padding:0; display:flex; flex-direction:column; box-shadow:0 10px 40px rgba(0,0,0,0.5); border:2px solid #72efdd; overflow:hidden; position:relative; box-sizing:border-box; }
+            #smart-doc-viewer .dv-head { display:flex; justify-content:space-between; align-items:center; gap:10px; padding:0 20px; background:#0d1b2a; border-bottom:1px solid #3e506e; min-height:50px; box-sizing:border-box; flex:none; }
+            #smart-doc-viewer #viewer-title { color:white; margin:0; font-size:1.1em; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; flex:1; min-width:0; }
+            #smart-doc-viewer .dv-actions { display:flex; gap:8px; align-items:center; flex:none; }
+            #smart-doc-viewer .dv-btn { background:#2b3a55; color:white; border:none; padding:6px 12px; border-radius:6px; cursor:pointer; font-weight:bold; font-size:0.9em; }
+            #smart-doc-viewer .dv-close { background:#dc3545; padding:6px 15px; }
+            #smart-doc-viewer #pdf-canvas-container { flex:1; min-height:0; overflow-y:auto; overflow-x:hidden; padding:20px; display:flex; flex-direction:column; align-items:center; background:#222; gap:15px; -webkit-overflow-scrolling:touch; }
+            #smart-doc-viewer canvas.doc-page { flex:none; width:100%; max-width:980px; height:auto; background:#fff; box-shadow:0 4px 10px rgba(0,0,0,0.5); }
+            #smart-doc-viewer .dv-foot { text-align:center; color:#888; font-size:0.75em; padding:5px; background:#0d1b2a; border-top:1px solid #3e506e; flex:none; }
+
+            /* Landscape phones: IMMERSIVE. The page owns the whole screen; header + controls are
+               overlays that appear on a tap on the page and fade away by themselves. */
+            @media (orientation:landscape) and (max-height:520px) {
+                #smart-doc-viewer .dv-box { width:100%; height:100%; border-radius:0; border:none; }
+                #smart-doc-viewer #pdf-canvas-container { position:absolute; top:0; left:0; right:0; bottom:0; height:100%; padding:0 env(safe-area-inset-right) 0 env(safe-area-inset-left); gap:4px; }
+                #smart-doc-viewer canvas.doc-page { max-width:none; box-shadow:none; }
+                #smart-doc-viewer .dv-foot { display:none; }
+
+                #smart-doc-viewer .dv-head { position:absolute; top:0; left:0; right:0; z-index:8; height:36px; min-height:0; padding:0 max(10px, env(safe-area-inset-right)) 0 max(10px, env(safe-area-inset-left)); background:rgba(13,27,42,.94); transform:translateY(-110%); transition:transform .2s ease; }
+                #smart-doc-viewer #viewer-title { font-size:.85em; text-align:left; margin:0 !important; }
+                #smart-doc-viewer .dv-btn { padding:0 10px !important; height:26px !important; min-height:0 !important; margin:0 !important; line-height:1 !important; font-size:.8em !important; }
+
+                #smart-doc-viewer #doc-reader-bar { position:absolute; left:0; right:0; bottom:0; z-index:8; background:rgba(13,27,42,.94) !important; transform:translateY(110%); transition:transform .2s ease; }
+                #smart-doc-viewer .dv-box.ui-on .dv-head, #smart-doc-viewer .dv-box.ui-on #doc-reader-bar { transform:none; }
+                #doc-reader-bar .dr-row { flex-wrap:nowrap !important; padding:2px 10px !important; gap:5px !important; }
+                #doc-reader-bar .dr-btn, #doc-reader-bar .dr-page { height:28px !important; min-height:0 !important; min-width:32px !important; padding:0 8px !important; margin:0 !important; line-height:1 !important; font-size:.85em !important; }
+                #doc-reader-bar .dr-status { display:none !important; }
+                #doc-reader-bar #doc-reader-settings { max-height:40dvh; overflow-y:auto; }
+                #doc-reader-bar #dr-furn-row { display:none !important; }
+                #doc-jump { max-height:70dvh; }
+            }
+
+            /* ---- Download progress + jump-to-page panel ---- */
+            .dp-track { height:10px; background:#2b3a55; border-radius:6px; overflow:hidden; }
+            .dp-fill { height:100%; width:0%; background:linear-gradient(90deg,#72efdd,#4ea8de); border-radius:6px; transition:width .25s ease; }
+            #doc-reader-bar { position:relative; flex:none; }
+            #doc-reader-bar .dr-row { display:flex; align-items:center; justify-content:center; flex-wrap:wrap; gap:6px; padding:8px 10px; }
+            #doc-reader-bar .dr-btn { min-width:40px; height:38px; padding:0 10px; border-radius:8px; border:1px solid #3e506e; background:#1a1a2e; color:#fff; font-size:1em; cursor:pointer; }
+            #doc-reader-bar .dr-btn:disabled { opacity:.4; cursor:default; }
+            #doc-reader-bar .dr-primary { background:#72efdd; color:#0d1b2a; border-color:#72efdd; font-weight:bold; min-width:46px; }
+            #doc-reader-bar .dr-page { color:#e0e6ed; font-size:.85em; min-width:96px; text-align:center; background:#1a1a2e; border:1px dashed #72efdd; border-radius:8px; height:38px; padding:0 10px; cursor:pointer; }
+            #doc-reader-bar .dr-status { color:#72efdd; font-size:.8em; }
+            #doc-reader-bar .dr-chip { border:1px solid #3e506e; background:#1a1a2e; color:#72efdd; border-radius:14px; padding:4px 12px; font-size:.75em; cursor:pointer; }
+            #doc-reader-bar .dr-chip.off { color:#a0a8b4; }
+            #doc-reader-bar .dr-set label { display:block; color:#a0a8b4; font-size:.8em; margin:8px 0 4px; }
+            #doc-reader-bar .dr-set select { width:100%; padding:9px; border-radius:8px; background:#1a1a2e; color:#fff; border:1px solid #3e506e; }
+            #doc-reader-bar .dr-set input[type=range] { width:100%; }
+            #doc-reader-bar.no-tts #dr-play, #doc-reader-bar.no-tts #dr-stop, #doc-reader-bar.no-tts #dr-speed, #doc-reader-bar.no-tts #dr-settings-btn, #doc-reader-bar.no-tts #dr-status { display:none; }
+            @media (max-width:480px) { #doc-reader-bar .dr-status { display:none; } }
+
+            #doc-jump { display:none; position:absolute; left:0; right:0; bottom:100%; background:#0d1b2a; border-top:2px solid #72efdd; box-shadow:0 -8px 24px rgba(0,0,0,.55); padding:10px 12px 12px; z-index:5; max-height:min(60dvh, 380px); flex-direction:column; box-sizing:border-box; }
+            #doc-jump .dj-top { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+            #doc-jump .dj-lbl { color:#a0a8b4; font-size:.8em; }
+            #doc-jump #dj-input { width:84px; padding:8px; border-radius:8px; background:#1a1a2e; color:#fff; border:1px solid #72efdd; font-size:1em; text-align:center; }
+            #doc-jump #dj-of { color:#e0e6ed; font-size:.9em; }
+            #doc-jump .dj-go { background:#72efdd; color:#0d1b2a; border:none; border-radius:8px; padding:9px 16px; font-weight:bold; cursor:pointer; }
+            #doc-jump .dj-x { margin-left:auto; background:transparent; color:#a0a8b4; border:1px solid #3e506e; border-radius:8px; padding:8px 12px; cursor:pointer; }
+            #doc-jump #dj-range { width:100%; margin:10px 0 6px; accent-color:#72efdd; }
+            #doc-jump .dj-list { overflow-y:auto; display:grid; grid-template-columns:repeat(auto-fill,minmax(54px,1fr)); gap:6px; padding:2px 0; -webkit-overflow-scrolling:touch; }
+            #doc-jump .dj-list button { padding:9px 0; border-radius:8px; border:1px solid #3e506e; background:#1a1a2e; color:#e0e6ed; font-size:.9em; cursor:pointer; }
+            #doc-jump .dj-list button.cur { background:#72efdd; color:#0d1b2a; border-color:#72efdd; font-weight:bold; }
+        </style>
+        <div class="dv-box">
+
             <!-- Header -->
-            <div style="display:flex; justify-content:space-between; align-items:center; padding:15px 20px; background:#0d1b2a; border-bottom:1px solid #3e506e; height:50px; box-sizing:border-box;">
-                <h3 id="viewer-title" style="color:white; margin:0; font-size:1.1em; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:70%;">Document</h3>
-                <button onclick="closeDocViewer()" style="background:#dc3545; color:white; border:none; padding:6px 15px; border-radius:6px; cursor:pointer; font-weight:bold; font-size:0.9em;">✕ Close</button>
+            <div class="dv-head">
+                <h3 id="viewer-title">Document</h3>
+                <div class="dv-actions">
+                    <button id="dv-fs" class="dv-btn" onclick="docToggleFullscreen()" aria-label="Full screen" title="Full screen">⛶</button>
+                    <button class="dv-btn dv-close" onclick="closeDocViewer()">✕ Close</button>
+                </div>
             </div>
 
             <!-- Loading Skeleton Overlay (Visible initially) -->
@@ -1359,28 +1427,23 @@ function injectDocViewerHTML() {
             </div>
 
             <!-- PDF.js canvas container (pages are drawn here) -->
-            <div id="pdf-canvas-container" style="flex:1; overflow-y:auto; padding:20px; display:flex; flex-direction:column; align-items:center; background:#222; gap:15px;">
+            <div id="pdf-canvas-container">
                 <!-- PDF.js will inject <canvas> elements here -->
             </div>
-            
-            <!-- Document voice reader (TTS) -->
-            <style>
-                .dp-track { height:10px; background:#2b3a55; border-radius:6px; overflow:hidden; }
-                .dp-fill { height:100%; width:0%; background:linear-gradient(90deg,#72efdd,#4ea8de); border-radius:6px; transition:width .25s ease; }
-                #doc-reader-bar .dr-row { display:flex; align-items:center; justify-content:center; flex-wrap:wrap; gap:6px; padding:8px 10px; }
-                #doc-reader-bar .dr-btn { min-width:40px; height:38px; padding:0 10px; border-radius:8px; border:1px solid #3e506e; background:#1a1a2e; color:#fff; font-size:1em; cursor:pointer; }
-                #doc-reader-bar .dr-btn:disabled { opacity:.4; cursor:default; }
-                #doc-reader-bar .dr-primary { background:#72efdd; color:#0d1b2a; border-color:#72efdd; font-weight:bold; min-width:46px; }
-                #doc-reader-bar .dr-page { color:#e0e6ed; font-size:.85em; min-width:84px; text-align:center; }
-                #doc-reader-bar .dr-status { color:#72efdd; font-size:.8em; }
-                #doc-reader-bar .dr-chip { border:1px solid #3e506e; background:#1a1a2e; color:#72efdd; border-radius:14px; padding:4px 12px; font-size:.75em; cursor:pointer; }
-                #doc-reader-bar .dr-chip.off { color:#a0a8b4; }
-                #doc-reader-bar .dr-set label { display:block; color:#a0a8b4; font-size:.8em; margin:8px 0 4px; }
-                #doc-reader-bar .dr-set select { width:100%; padding:9px; border-radius:8px; background:#1a1a2e; color:#fff; border:1px solid #3e506e; }
-                #doc-reader-bar .dr-set input[type=range] { width:100%; }
-                @media (max-width:480px) { #doc-reader-bar .dr-status { display:none; } }
-            </style>
+
+            <!-- Page navigation + document voice reader (TTS) -->
             <div id="doc-reader-bar" style="display:none; background:#0d1b2a; border-top:1px solid #3e506e;">
+                <div id="doc-jump">
+                    <div class="dj-top">
+                        <span class="dj-lbl">Go to page</span>
+                        <input id="dj-input" type="number" inputmode="numeric" min="1" step="1" placeholder="#" aria-label="Page number">
+                        <span id="dj-of">/ 1</span>
+                        <button class="dj-go" onclick="docJumpSubmit()">Go</button>
+                        <button class="dj-x" onclick="docJumpClose()" aria-label="Close page list">✕</button>
+                    </div>
+                    <input id="dj-range" type="range" min="1" max="1" value="1" aria-label="Scrub through pages">
+                    <div id="dj-list" class="dj-list"></div>
+                </div>
                 <div id="doc-reader-settings" class="dr-set" style="display:none; padding:6px 14px 10px; border-bottom:1px solid #3e506e;">
                     <label for="dr-voice">Voice</label>
                     <select id="dr-voice" onchange="setTtsVoice(this.value)"></select>
@@ -1395,22 +1458,29 @@ function injectDocViewerHTML() {
                 <div class="dr-row">
                     <button id="dr-play" class="dr-btn dr-primary" onclick="docReaderToggle()" aria-label="Read aloud">▶</button>
                     <button id="dr-prev" class="dr-btn" onclick="docReaderStep(-1)" aria-label="Previous page">⏮</button>
-                    <span id="dr-page" class="dr-page">Page 1 / 1</span>
+                    <button id="dr-page" class="dr-page" onclick="docJumpToggle()" aria-label="Choose a page">Page 1 / 1 ▾</button>
                     <button id="dr-next" class="dr-btn" onclick="docReaderStep(1)" aria-label="Next page">⏭</button>
                     <button id="dr-stop" class="dr-btn" onclick="docReaderStop()" aria-label="Stop reading" disabled>⏹</button>
                     <button id="dr-speed" class="dr-btn" onclick="docReaderCycleSpeed()" aria-label="Reading speed">1×</button>
-                    <button class="dr-btn" onclick="docReaderToggleSettings()" aria-label="Reader settings">🎛️</button>
+                    <button id="dr-settings-btn" class="dr-btn" onclick="docReaderToggleSettings()" aria-label="Reader settings">🎛️</button>
                     <span id="dr-status" class="dr-status">🎧 Read aloud</span>
                 </div>
             </div>
 
-            <div style="text-align:center; color:#888; font-size:0.75em; padding:5px; background:#0d1b2a; border-top:1px solid #3e506e;">
+            <div class="dv-foot">
                 Protected Content - Kaeri EdTech
             </div>
         </div>
     </div>`;
-    
+
     document.body.insertAdjacentHTML('beforeend', viewerHTML);
+
+    // Hide the full-screen button where the browser can't do it (e.g. iPhone Safari); landscape still maximises via CSS
+    if (!(document.fullscreenEnabled || document.webkitFullscreenEnabled)) {
+        const fs = document.getElementById('dv-fs');
+        if (fs) fs.style.display = 'none';
+    }
+    _docBindJumpInputs();
 }
 
 // ── Stage 1: show the modal + shimmer skeleton IMMEDIATELY (instant feedback on tap) ──
@@ -1429,6 +1499,8 @@ function showDocViewerLoading(title) {
     
     titleEl.textContent = title || "Document";
     container.innerHTML = "";                             // Clear previous to prevent ghosting
+    container.scrollTop = 0;
+    _docQ.list = []; _docLastPage = 1; _docJump = null; _docFsTried = false;
     _docResetUi();                                        // clear progress bar + voice reader from any previous document
     if (loaderText) loaderText.textContent = 'Verifying access...';
     if (loader) loader.style.display = 'flex';            // Show shimmer right now
@@ -1592,24 +1664,25 @@ async function renderPdfFromBase64(base64Data, title) {
         const titleEl = document.getElementById('viewer-title');
         if (titleEl) titleEl.textContent = title + ' (' + pdf.numPages + ' pages)';
 
-        // Render every page
+        // One placeholder per page (correct shape, nothing drawn yet) so every page exists and can be jumped to.
+        // Pages are then drawn on demand, nearest to the reader first.
+        const first = await pdf.getPage(1);
+        if (myRenderId !== _docRenderId) return;
+        const base = first.getViewport({ scale: 1 });
+        const frag = document.createDocumentFragment();
         for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
-            const page = await pdf.getPage(pageNum);
-            if (myRenderId !== _docRenderId) return;
-            const viewport = page.getViewport({ scale: 1.5 }); // Scale 1.5 makes it readable on mobile
-
             const canvas = document.createElement('canvas');
-            const context = canvas.getContext('2d');
-            canvas.height = viewport.height;
-            canvas.width = viewport.width;
+            canvas.className = 'doc-page';
+            canvas.width = 1; canvas.height = 1;
             canvas.dataset.page = pageNum;
-            canvas.style.maxWidth = '100%';
-            canvas.style.boxShadow = '0 4px 10px rgba(0,0,0,0.5)';
-            canvas.style.background = 'white';
-            container.appendChild(canvas);
-
-            await page.render({ canvasContext: context, viewport: viewport }).promise;
+            canvas.style.aspectRatio = base.width + ' / ' + base.height;
+            frag.appendChild(canvas);
         }
+        container.appendChild(frag);
+        _docQ.list = []; _docLastPage = 1;
+        _docBindViewerEvents();
+        _docJumpBuild();
+        _docPump();
 
         // Fire-and-forget analytics
         logAnalyticsEvent('document_view', `Viewed: ${title}`);
@@ -1960,7 +2033,7 @@ function _docReaderSyncUi() {
     const reading = r.active && !ttsPaused;
     if (play) { play.textContent = reading ? '⏸' : '▶'; play.setAttribute('aria-label', reading ? 'Pause reading' : (ttsPaused ? 'Resume reading' : 'Read aloud')); }
     if (stop) stop.disabled = !r.active;
-    if (pg) pg.textContent = 'Page ' + (r.active ? r.page : _docVisiblePage()) + ' / ' + r.total;
+    if (pg) pg.textContent = 'Page ' + (r.active ? r.page : _docVisiblePage()) + ' / ' + r.total + ' ▾';
     const rateTxt = ttsRate.toFixed(2).replace(/0$/, '').replace(/\.0$/, '') + '×';
     if (spd) spd.textContent = rateTxt;
     if (rl) rl.textContent = rateTxt;
@@ -2003,7 +2076,7 @@ function _docReaderInit(numPages) {
     });
     _docReader.token++;
     const bar = document.getElementById('doc-reader-bar');
-    if (bar) bar.style.display = ttsSupported ? 'block' : 'none';
+    if (bar) { bar.style.display = 'block'; bar.classList.toggle('no-tts', !ttsSupported); }   // page navigation works even where read-aloud can't
     const c = document.getElementById('pdf-canvas-container');
     if (c && !_docScrollBound) {
         _docScrollBound = true;
@@ -2026,6 +2099,7 @@ function _docResetUi() {
     ttsOnFinish = null;
     const bar = document.getElementById('doc-reader-bar');
     if (bar) bar.style.display = 'none';
+    docJumpClose();
     _docFurn.keys = new Set(); _docFurn.list = []; _docFurn.learning = false; _docFurn.ready = Promise.resolve();
     _docFurnSyncUi();
     const set = document.getElementById('doc-reader-settings');
@@ -2175,6 +2249,356 @@ function docReaderToggleSettings() {
     if (open) { _docFillVoices(); _docReaderSyncUi(); }
 }
 
+
+// ============================================================
+// === DOCUMENT VIEWER: lazy page rendering, jump-to-page, rotation + full screen ===
+// ============================================================
+const _docQ = { list: [], running: false };
+let _docLastPage = 1;            // page nearest the top of the viewer (kept fresh by the scroll handler)
+let _docJump = null;             // { page, until }: a jump in progress, re-aligned while pages above it settle
+const _DOC_KEEP = 16;            // rendered pages kept in memory; the farthest are blanked (placeholders stay)
+const _DOC_MAX_PIXELS = 4500000; // cap per page canvas so big pages can't exhaust phone memory
+
+function _docCanvasFor(n) {
+    const c = document.getElementById('pdf-canvas-container');
+    return c ? c.querySelector('canvas[data-page="' + n + '"]') : null;
+}
+
+/** Sharpness for the CURRENT width: portrait and landscape both get crisp text. */
+function _docScaleFor(w, h) {
+    const c = document.getElementById('pdf-canvas-container');
+    let avail = 360;
+    if (c && c.clientWidth > 0) {
+        const cs = getComputedStyle(c);
+        avail = c.clientWidth - (parseFloat(cs.paddingLeft) || 0) - (parseFloat(cs.paddingRight) || 0);
+    }
+    const landscapeFull = window.matchMedia && window.matchMedia('(orientation:landscape) and (max-height:520px)').matches;
+    const disp = landscapeFull ? avail : Math.min(avail, 980);
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    let s = Math.max(1.5, (disp * dpr) / w);
+    if (w * h * s * s > _DOC_MAX_PIXELS) s = Math.sqrt(_DOC_MAX_PIXELS / (w * h));
+    return Math.max(s, 0.8);
+}
+
+async function _docRenderPage(n) {
+    const pdf = _docPdf, id = _docRenderId;
+    const cv = _docCanvasFor(n);
+    if (!pdf || !cv) return;
+    try {
+        const page = await pdf.getPage(n);
+        if (id !== _docRenderId || pdf !== _docPdf) return;
+        const v1 = page.getViewport({ scale: 1 });
+        const scale = _docScaleFor(v1.width, v1.height);
+        if (cv.dataset.done === '1' && parseFloat(cv.dataset.scale) >= scale * 0.9) { cv.dataset.stale = ''; return; }
+        const vp = page.getViewport({ scale: scale });
+        cv.width = Math.floor(vp.width);
+        cv.height = Math.floor(vp.height);
+        cv.style.aspectRatio = v1.width + ' / ' + v1.height;
+        await page.render({ canvasContext: cv.getContext('2d'), viewport: vp }).promise;
+        if (id !== _docRenderId || pdf !== _docPdf) return;
+        cv.dataset.done = '1'; cv.dataset.scale = scale; cv.dataset.stale = '';
+        _docEvict();
+        // pages above a jump target settling can nudge it: re-align while the jump is fresh
+        if (_docJump && Date.now() < _docJump.until && n <= _docJump.page) _docScrollToPage(_docJump.page, false);
+    } catch (e) { /* viewer closed or page failed: leave the placeholder */ }
+}
+
+function _docEvict() {
+    const done = _docCanvases().filter(cv => cv.dataset.done === '1');
+    if (done.length <= _DOC_KEEP) return;
+    done.sort((a, b) => Math.abs((+b.dataset.page) - _docLastPage) - Math.abs((+a.dataset.page) - _docLastPage));
+    done.slice(0, done.length - _DOC_KEEP).forEach(cv => { cv.width = 1; cv.height = 1; cv.dataset.done = ''; });
+}
+
+async function _docRunQueue() {
+    if (_docQ.running) return;
+    _docQ.running = true;
+    try {
+        while (_docQ.list.length && _docPdf) {
+            _docQ.list.sort((a, b) => Math.abs(a - _docLastPage) - Math.abs(b - _docLastPage));
+            await _docRenderPage(_docQ.list.shift());
+        }
+    } finally { _docQ.running = false; }
+}
+
+function _docQueue(n) {
+    if (_docQ.list.indexOf(n) === -1) _docQ.list.push(n);
+    _docRunQueue();
+}
+
+/** Queue every page within ~1.5 screens of the viewport that is not drawn yet (or is drawn too small). */
+function _docPump() {
+    const c = document.getElementById('pdf-canvas-container');
+    if (!c || !_docPdf) return;
+    const cvs = _docCanvases();
+    if (!cvs.length) return;
+    const cr = c.getBoundingClientRect();
+    if (cr.height <= 0) return;
+    const margin = cr.height * 1.5;
+    let found = 0;
+    for (let i = Math.max(0, _docLastPage - 1 - 8); i < cvs.length; i++) {
+        const r = cvs[i].getBoundingClientRect();
+        if (r.top > cr.bottom + margin) break;
+        if (r.bottom < cr.top - margin) continue;
+        if (cvs[i].dataset.done !== '1' || cvs[i].dataset.stale === '1') { _docQueue(parseInt(cvs[i].dataset.page, 10)); if (++found >= 12) break; }
+    }
+}
+
+function _docScrollToPage(n, smooth) {
+    const c = document.getElementById('pdf-canvas-container');
+    const t = _docCanvasFor(n);
+    if (!c || !t) return;
+    const y = t.getBoundingClientRect().top - c.getBoundingClientRect().top + c.scrollTop - 8;
+    try { c.scrollTo({ top: y, behavior: smooth ? 'smooth' : 'auto' }); } catch (e) { c.scrollTop = y; }
+}
+
+// ---------- Jump to page ----------
+function _docJumpBuild() {
+    const total = _docReader.total || 0;
+    const list = document.getElementById('dj-list');
+    const inp = document.getElementById('dj-input');
+    const rng = document.getElementById('dj-range');
+    const of = document.getElementById('dj-of');
+    if (!list || !total) return;
+    if (list.dataset.total !== String(total)) {
+        let h = '';
+        for (let i = 1; i <= total; i++) h += '<button type="button" data-n="' + i + '">' + i + '</button>';
+        list.innerHTML = h;
+        list.dataset.total = String(total);
+    }
+    if (inp) { inp.max = total; inp.placeholder = '1-' + total; }
+    if (rng) { rng.max = total; }
+    if (of) of.textContent = '/ ' + total;
+}
+
+function _docJumpMark() {
+    const list = document.getElementById('dj-list');
+    if (!list) return;
+    const cur = _docReader.active ? _docReader.page : _docVisiblePage();
+    const old = list.querySelector('button.cur');
+    if (old) old.classList.remove('cur');
+    const b = list.querySelector('button[data-n="' + cur + '"]');
+    if (b) {
+        b.classList.add('cur');
+        list.scrollTop = Math.max(0, b.offsetTop - list.offsetTop - list.clientHeight / 2 + b.offsetHeight / 2);
+    }
+    const inp = document.getElementById('dj-input');
+    const rng = document.getElementById('dj-range');
+    if (inp) inp.value = cur;
+    if (rng) rng.value = cur;
+}
+
+function docJumpToggle() {
+    const p = document.getElementById('doc-jump');
+    if (!p || !_docReader.total) return;
+    if (p.style.display === 'flex') { docJumpClose(); return; }
+    _docJumpBuild();
+    p.style.display = 'flex';
+    _docJumpMark();
+    const inp = document.getElementById('dj-input');
+    if (inp) { try { inp.select(); } catch (e) {} }   // select, not focus-by-force: tapping the list works without opening the keyboard first
+}
+
+function docJumpClose() {
+    const p = document.getElementById('doc-jump');
+    if (p) p.style.display = 'none';
+}
+
+/** Go to page n (1-based). Returns false when n is not a valid page. */
+function docJumpTo(n) {
+    const total = _docReader.total || 0;
+    n = parseInt(n, 10);
+    if (!total || !isFinite(n)) return false;
+    if (n < 1 || n > total) {
+        showAppNotification('⚠️ This document has pages 1 to ' + total + '.', 'warning', 2200);
+        return false;
+    }
+    _docLastPage = n;
+    _docJump = { page: n, until: Date.now() + 4000 };
+    if (_docReader.active) {
+        _docReaderPlayFrom(n);            // reading follows you to the new page (and scrolls there)
+    } else {
+        _docScrollToPage(n, false);
+    }
+    _docQueue(n);
+    _docPump();
+    docJumpClose();
+    setTimeout(function () { _docReaderSyncUi(); }, 120);
+    return true;
+}
+
+function docJumpSubmit() {
+    const inp = document.getElementById('dj-input');
+    if (!inp) return;
+    if (inp.value === '') { return; }
+    const ok = docJumpTo(inp.value);
+    if (!ok) _docJumpMark();   // bad number: put the current page back
+}
+
+function _docBindJumpInputs() {
+    const inp = document.getElementById('dj-input');
+    const rng = document.getElementById('dj-range');
+    const list = document.getElementById('dj-list');
+    if (inp && !inp._kb) {
+        inp._kb = true;
+        inp.addEventListener('keydown', function (e) {
+            if (e.key === 'Enter') { e.preventDefault(); docJumpSubmit(); }
+            else if (e.key === 'Escape') { e.stopPropagation(); docJumpClose(); }   // close the panel, not the whole viewer
+        });
+        inp.addEventListener('input', function () {
+            const v = parseInt(inp.value, 10), t = _docReader.total || 0;
+            if (rng && v >= 1 && v <= t) rng.value = v;
+        });
+    }
+    if (rng && !rng._kb) {
+        rng._kb = true;
+        rng.addEventListener('input', function () { if (inp) inp.value = rng.value; });
+        rng.addEventListener('change', function () { docJumpTo(rng.value); });
+    }
+    if (list && !list._kb) {
+        list._kb = true;
+        list.addEventListener('click', function (e) {
+            const b = e.target.closest ? e.target.closest('button[data-n]') : null;
+            if (b) docJumpTo(b.dataset.n);
+        });
+    }
+}
+
+// ---------- Scroll / rotation / full screen ----------
+let _docRzTimer = 0, _docRzAnchor = 0;
+
+function _docBindViewerEvents() {
+    const c = document.getElementById('pdf-canvas-container');
+    _docBindImmersive();
+    if (!c || c._kvBound) return;
+    c._kvBound = true;
+    let raf = 0;
+    c.addEventListener('scroll', function () {
+        if (raf) return;
+        raf = requestAnimationFrame(function () {
+            raf = 0;
+            if (!_docRzAnchor && _docPdf) _docLastPage = _docVisiblePage();
+            _docPump();
+            if (document.getElementById('doc-jump') && document.getElementById('doc-jump').style.display === 'flex') _docJumpMark();
+        });
+    }, { passive: true });
+    // the reader touching the page ends any jump re-alignment
+    ['touchstart', 'wheel', 'mousedown'].forEach(function (ev) {
+        c.addEventListener(ev, function () { _docJump = null; }, { passive: true });
+    });
+}
+
+// ---------- Landscape immersive mode: controls appear on tap, hide by themselves ----------
+const _DOC_LANDSCAPE_MQ = '(orientation:landscape) and (max-height:520px)';
+let _docUiTimer = 0, _docFsTried = false;
+
+function _docIsLandscapeFull() { return !!(window.matchMedia && window.matchMedia(_DOC_LANDSCAPE_MQ).matches); }
+
+function _docUiShow(on) {
+    const box = document.querySelector('#smart-doc-viewer .dv-box');
+    if (!box) return;
+    box.classList.toggle('ui-on', !!on);
+    clearTimeout(_docUiTimer);
+    if (!on) return;
+    const tick = function () {
+        const jp = document.getElementById('doc-jump');
+        const st = document.getElementById('doc-reader-settings');
+        const busy = (jp && jp.style.display === 'flex') || (st && st.style.display === 'block') ||
+                     (document.activeElement && document.activeElement.id === 'dj-input');
+        if (busy) { _docUiTimer = setTimeout(tick, 3000); return; }   // never hide while the page picker / settings are in use
+        box.classList.remove('ui-on');
+    };
+    _docUiTimer = setTimeout(tick, 4000);
+}
+
+function _docBindImmersive() {
+    const c = document.getElementById('pdf-canvas-container');
+    const bar = document.getElementById('doc-reader-bar');
+    const head = document.querySelector('#smart-doc-viewer .dv-head');
+    if (c && !c._kvTap) {
+        c._kvTap = true;
+        // click only fires for a real tap (not a scroll drag)
+        c.addEventListener('click', function () {
+            if (!_docIsLandscapeFull()) return;
+            const box = document.querySelector('#smart-doc-viewer .dv-box');
+            _docUiShow(!(box && box.classList.contains('ui-on')));
+            if (!_docFsTried && !_docIsFullscreen()) {      // first tap = a real gesture: hide the browser's own bars too
+                _docFsTried = true;
+                try { const v = document.getElementById('smart-doc-viewer'); const rq = v.requestFullscreen || v.webkitRequestFullscreen; if (rq) { const p = rq.call(v); if (p && p.catch) p.catch(function () {}); } } catch (e) {}
+            }
+        });
+    }
+    // using a control keeps the overlay alive
+    [bar, head].forEach(function (el) {
+        if (el && !el._kvKeep) {
+            el._kvKeep = true;
+            ['click', 'touchstart', 'input'].forEach(function (ev) {
+                el.addEventListener(ev, function () {
+                    const box = document.querySelector('#smart-doc-viewer .dv-box');
+                    if (box && box.classList.contains('ui-on')) _docUiShow(true);
+                }, { passive: true });
+            });
+        }
+    });
+    if (window.matchMedia && !window._kvMqBound) {
+        window._kvMqBound = true;
+        const mq = window.matchMedia(_DOC_LANDSCAPE_MQ);
+        const onChange = function () {
+            const v = document.getElementById('smart-doc-viewer');
+            if (!v || !v.style.display || v.style.display === 'none') return;
+            if (mq.matches) _docUiShow(true);   // rotated to landscape: show controls briefly, then the page takes over
+        };
+        if (mq.addEventListener) mq.addEventListener('change', onChange); else if (mq.addListener) mq.addListener(onChange);
+    }
+    if (_docIsLandscapeFull()) _docUiShow(true);
+}
+
+function _docOnResize() {
+    const v = document.getElementById('smart-doc-viewer');
+    if (!v || !v.style.display || v.style.display === 'none' || !_docPdf) return;
+    if (!_docRzAnchor) _docRzAnchor = _docReader.active ? _docReader.page : _docLastPage;   // remember where the reader was BEFORE the layout changed
+    clearTimeout(_docRzTimer);
+    _docRzTimer = setTimeout(function () {
+        const n = _docRzAnchor || 1;
+        _docRzAnchor = 0;
+        _docCanvases().forEach(function (cv) { if (cv.dataset.done === '1') cv.dataset.stale = '1'; });   // redraw at the new width's sharpness
+        _docScrollToPage(n, false);
+        _docLastPage = n;
+        _docJump = { page: n, until: Date.now() + 1500 };
+        _docQueue(n);
+        _docPump();
+        _docReaderSyncUi();
+    }, 250);
+}
+window.addEventListener('resize', _docOnResize);
+window.addEventListener('orientationchange', _docOnResize);
+
+function _docIsFullscreen() { return !!(document.fullscreenElement || document.webkitFullscreenElement); }
+
+function docToggleFullscreen() {
+    const v = document.getElementById('smart-doc-viewer');
+    if (!v) return;
+    try {
+        if (_docIsFullscreen()) {
+            (document.exitFullscreen || document.webkitExitFullscreen).call(document);
+        } else {
+            const req = v.requestFullscreen || v.webkitRequestFullscreen;
+            if (req) req.call(v);
+        }
+    } catch (e) {}
+}
+
+function _docExitFullscreen() {
+    try { if (_docIsFullscreen()) (document.exitFullscreen || document.webkitExitFullscreen).call(document); } catch (e) {}
+}
+
+['fullscreenchange', 'webkitfullscreenchange'].forEach(function (ev) {
+    document.addEventListener(ev, function () {
+        const b = document.getElementById('dv-fs');
+        if (b) b.textContent = _docIsFullscreen() ? '🗗' : '⛶';
+    });
+});
+
 // ── Non-PDF fallback (video, PPTX, Word): Drive preview iframe. Needs internet; not cached. ──
 function loadNonPdfPreview(fileId, title) {
     const container = document.getElementById('pdf-canvas-container');
@@ -2197,6 +2621,7 @@ function openDocumentViewer(fileId, title) {
 function closeDocViewer() {
     const viewer = document.getElementById('smart-doc-viewer');
     if (viewer) {
+        _docExitFullscreen();
         viewer.style.display = 'none';
         _docRenderId++;   // stop any in-flight PDF render
         _docResetUi();    // cancel a running download, stop the progress bar and the voice reader
