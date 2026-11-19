@@ -242,7 +242,7 @@ const KAERI_CONFIG = {
     // ─── THE ONLY TWO ACTIVE BACKENDS ───
     
     // 1. Gatekeeper Backend (Auth, Docs, Analytics)
-    gatekeeperUrl:      "https://script.google.com/macros/s/AKfycbz-MRtXXBc57A4TQAlja7vfJN3I7umOWALMZiN_-TPYkzRHn8uX7LURrnG0TNRokPFfiQ/exec",
+    gatekeeperUrl:      "https://script.google.com/macros/s/AKfycbyiUoOstDK__mVvnvvLaWzjyfE4Yf1Hxe0J8RJD21Suoe4I1b7MUkWnmu9G_ntB5d_w/exec",
     
     // 2. AMB-PAY Backend (Payments, Config, Bridge)
     ambPayUrl:          "https://script.google.com/macros/s/AKfycbzeN2ZWwnBReNQnvu_1GUr6qZMGmTNUi2e7-byJnFtkJRs6st2LyGyAgBKDwaP9jv5S/exec",
@@ -901,6 +901,10 @@ function loadFlashcardsForTermKey(termKey, course, term) {
 // _modeLoadFailed marks a FAILED load (offline / manifest file unreachable) so a network
 // problem is never mistaken for "no data": a failed mode stays visible and is retried.
 const _modeLoadFailed = {};   // termKey → { mcq, essay, flashcard, documents }
+const _docsLocked = {};      // termKey → number of documents the server is hiding from free users (undefined = not hidden)
+const _videosLocked = {};    // same for videos
+/** The student's session for list/thumbnail requests, or undefined in free mode. */
+function _sessionForDocs() { return (hasFullAccess && userCode && userEmail) ? { code: userCode, email: userEmail } : undefined; }
 const _docsCache = {};        // termKey → documents list from the Gatekeeper ([] = this term has none)
 const _videosCache = {};      // termKey → videos list from the Gatekeeper ([] = this term has none)
 
@@ -962,8 +966,8 @@ function _modeAvailability() {
         renderShortAnswers:    (currentShortData || []).length > 0,
         renderEssaySimulation: (currentEssayData || []).length > 0 || !!f.essay,
         renderFlashcardTopics: Object.keys(currentFlashcardTopics || {}).length > 0 || !!f.flashcard,
-        renderDocuments:       (_docsCache[currentTermKey] || []).length > 0 || !!f.documents,
-        renderVideos:          (_videosCache[currentTermKey] || []).length > 0
+        renderDocuments:       (_docsCache[currentTermKey] || []).length > 0 || (_docsLocked[currentTermKey] || 0) > 0 || !!f.documents,
+        renderVideos:          (_videosCache[currentTermKey] || []).length > 0 || (_videosLocked[currentTermKey] || 0) > 0
     };
 }
 
@@ -1045,17 +1049,26 @@ function _dashModeVisible(fn, historical) {
 async function _fetchDocsForTerm(termKey, course, term) {
     if (_docsCache[termKey]) return _docsCache[termKey];
     try {
-        const response = await fetch(DOCS_SCRIPT_URL, {
-            method: 'POST',
-            redirect: 'follow',
-            headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-            body: JSON.stringify({ action: 'GET_STUDENT_DOCS', course: course, term: term })
-        });
-        if (!response.ok) throw new Error('docs http ' + response.status);
-        const data = await response.json();
+        let data = null;
+        for (let pass = 0; pass < 2; pass++) {
+            const session = _sessionForDocs();
+            const response = await fetch(DOCS_SCRIPT_URL, {
+                method: 'POST',
+                redirect: 'follow',
+                headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+                body: JSON.stringify({ action: 'GET_STUDENT_DOCS', course: course, term: term, session: session })
+            });
+            if (!response.ok) throw new Error('docs http ' + response.status);
+            data = await response.json();
+            const hidden = !!(data && data.success && data.data && data.data.locked);
+            if (hidden && !session && _sessionForDocs()) continue;   // access arrived while this request was in flight
+            break;
+        }
+        const d = (data && data.data) || {};
         const list = (data && data.success)
-            ? (data.documents || (data.data && data.data.documents) || [])
+            ? (data.documents || d.documents || [])
             : [];
+        if (d.locked) _docsLocked[termKey] = Number(d.count) || 0; else delete _docsLocked[termKey];
         _docsCache[termKey] = list;
         _setModeFailed(termKey, 'documents', false);
         return list;
@@ -1086,19 +1099,28 @@ async function _fetchVideosForTerm(termKey, course, term) {
     const failed = !!(_modeLoadFailed[termKey] && _modeLoadFailed[termKey].videos);
     if (_videosCache[termKey] && !failed) return _videosCache[termKey];
     try {
-        const response = await fetch(DOCS_SCRIPT_URL, {
-            method: 'POST',
-            redirect: 'follow',
-            headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-            body: JSON.stringify({ action: 'GET_STUDENT_VIDEOS', course: course, term: term })
-        });
-        if (!response.ok) throw new Error('videos http ' + response.status);
-        const data = await response.json();
-        if (!data || !data.success) throw new Error('videos not ok');
+        let data = null;
+        for (let pass = 0; pass < 2; pass++) {
+            const session = _sessionForDocs();
+            const response = await fetch(DOCS_SCRIPT_URL, {
+                method: 'POST',
+                redirect: 'follow',
+                headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+                body: JSON.stringify({ action: 'GET_STUDENT_VIDEOS', course: course, term: term, session: session })
+            });
+            if (!response.ok) throw new Error('videos http ' + response.status);
+            data = await response.json();
+            if (!data || !data.success) throw new Error('videos not ok');
+            const hidden = !!(data.data && data.data.locked);
+            if (hidden && !session && _sessionForDocs()) continue;   // access arrived while this request was in flight
+            break;
+        }
         const list = (data.data && data.data.videos) || data.videos || [];
+        const hiddenCount = (data.data && data.data.locked) ? (Number(data.data.count) || 0) : undefined;
+        if (hiddenCount !== undefined) _videosLocked[termKey] = hiddenCount; else delete _videosLocked[termKey];
         _videosCache[termKey] = list;
         _setModeFailed(termKey, 'videos', false);
-        try { localStorage.setItem('kaeri_videos_' + termKey, JSON.stringify(list)); } catch (e) {}
+        if (hiddenCount === undefined) { try { localStorage.setItem('kaeri_videos_' + termKey, JSON.stringify(list)); } catch (e) {} }   // never save a hidden (empty) list over a real one
         return list;
     } catch (e) {
         _setModeFailed(termKey, 'videos', true);
@@ -1345,6 +1367,7 @@ function injectDocViewerHTML() {
             #smart-doc-viewer .dv-btn { background:#2b3a55; color:white; border:none; padding:6px 12px; border-radius:6px; cursor:pointer; font-weight:bold; font-size:0.9em; }
             #smart-doc-viewer .dv-close { background:#dc3545; padding:6px 15px; }
             #smart-doc-viewer #pdf-canvas-container { flex:1; min-height:0; overflow-y:auto; overflow-x:hidden; padding:20px; display:flex; flex-direction:column; align-items:center; background:#222; gap:15px; -webkit-overflow-scrolling:touch; }
+            #smart-doc-viewer #pdf-canvas-container:focus { outline:none; }
             #smart-doc-viewer canvas.doc-page { flex:none; width:100%; max-width:980px; height:auto; background:#fff; box-shadow:0 4px 10px rgba(0,0,0,0.5); }
             #smart-doc-viewer .dv-foot { text-align:center; color:#888; font-size:0.75em; padding:5px; background:#0d1b2a; border-top:1px solid #3e506e; flex:none; }
 
@@ -1368,6 +1391,21 @@ function injectDocViewerHTML() {
                 #doc-reader-bar #doc-reader-settings { max-height:40dvh; overflow-y:auto; }
                 #doc-reader-bar #dr-furn-row { display:none !important; }
                 #doc-jump { max-height:70dvh; }
+            }
+
+            @media (hover:none) and (pointer:coarse) { #dv-help { display:none; } }
+            #doc-help { display:none; position:absolute; top:0; left:0; right:0; bottom:0; z-index:20; background:rgba(5,10,20,.94); align-items:center; justify-content:center; padding:12px; box-sizing:border-box; }
+            #doc-help .dh-card { background:#0d1b2a; border:1px solid #72efdd; border-radius:12px; padding:16px 20px; max-width:560px; width:100%; max-height:100%; overflow-y:auto; color:#e0e6ed; font-size:.9em; }
+            #doc-help h4 { margin:0 0 10px; color:#72efdd; }
+            #doc-help .dh-grid { display:grid; grid-template-columns:auto 1fr; gap:6px 14px; align-items:center; }
+            #doc-help kbd { background:#1a1a2e; border:1px solid #3e506e; border-bottom-width:2px; border-radius:5px; padding:1px 7px; font:inherit; font-size:.85em; color:#fff; white-space:nowrap; }
+            #doc-help .dh-note { color:#7d8797; font-size:.8em; margin-top:10px; }
+
+            /* ---- No printing while a document is open: the browser prints an empty page ---- */
+            @media print {
+                html, body.kv-doc-open { background:#fff !important; }
+                body.kv-doc-open > * { display:none !important; }
+                body.kv-doc-open::before { content:"Protected content - printing is disabled."; display:block; padding:48px 24px; font:20px/1.4 sans-serif; color:#000; text-align:center; }
             }
 
             /* ---- Download progress + jump-to-page panel ---- */
@@ -1406,6 +1444,7 @@ function injectDocViewerHTML() {
             <div class="dv-head">
                 <h3 id="viewer-title">Document</h3>
                 <div class="dv-actions">
+                    <button id="dv-help" class="dv-btn" onclick="docHelpToggle()" aria-label="Keyboard shortcuts" title="Keyboard shortcuts (?)">⌨</button>
                     <button id="dv-fs" class="dv-btn" onclick="docToggleFullscreen()" aria-label="Full screen" title="Full screen">⛶</button>
                     <button class="dv-btn dv-close" onclick="closeDocViewer()">✕ Close</button>
                 </div>
@@ -1427,7 +1466,7 @@ function injectDocViewerHTML() {
             </div>
 
             <!-- PDF.js canvas container (pages are drawn here) -->
-            <div id="pdf-canvas-container">
+            <div id="pdf-canvas-container" tabindex="-1">
                 <!-- PDF.js will inject <canvas> elements here -->
             </div>
 
@@ -1467,6 +1506,26 @@ function injectDocViewerHTML() {
                 </div>
             </div>
 
+            <div id="doc-help" onclick="docHelpToggle()">
+                <div class="dh-card" onclick="event.stopPropagation()">
+                    <h4>⌨ Keyboard shortcuts</h4>
+                    <div class="dh-grid">
+                        <span><kbd>↑</kbd> <kbd>↓</kbd> <kbd>PgUp</kbd> <kbd>PgDn</kbd> <kbd>Space</kbd></span><span>Scroll the document</span>
+                        <span><kbd>→</kbd> / <kbd>N</kbd></span><span>Next page</span>
+                        <span><kbd>←</kbd> / <kbd>P</kbd></span><span>Previous page</span>
+                        <span><kbd>Home</kbd> / <kbd>End</kbd></span><span>First / last page</span>
+                        <span><kbd>G</kbd> or <kbd>/</kbd></span><span>Go to page (type a number, then Enter)</span>
+                        <span><kbd>K</kbd></span><span>Read aloud: play / pause</span>
+                        <span><kbd>S</kbd></span><span>Stop reading</span>
+                        <span><kbd>+</kbd> / <kbd>-</kbd></span><span>Reading speed faster / slower</span>
+                        <span><kbd>F</kbd></span><span>Full screen on / off</span>
+                        <span><kbd>?</kbd> / <kbd>H</kbd></span><span>Show / hide this help</span>
+                        <span><kbd>Esc</kbd></span><span>Close help, then the page list, then the document</span>
+                    </div>
+                    <div class="dh-note">Printing (Ctrl+P) is disabled for protected documents.</div>
+                </div>
+            </div>
+
             <div class="dv-foot">
                 Protected Content - Kaeri EdTech
             </div>
@@ -1497,7 +1556,9 @@ function showDocViewerLoading(title) {
         return;
     }
     
+    _uvRelease();
     titleEl.textContent = title || "Document";
+    document.body.classList.add('kv-doc-open');           // print is blanked while a document is open
     container.innerHTML = "";                             // Clear previous to prevent ghosting
     container.scrollTop = 0;
     _docQ.list = []; _docLastPage = 1; _docJump = null; _docFsTried = false;
@@ -1627,7 +1688,7 @@ async function clearOfflineDocs() {
             tx.onabort = () => resolve(false);
         });
         try { db.close(); } catch (e) {}
-        try { if ('caches' in window) await caches.delete('kaeri-video-chunks-v1'); } catch (e) {}   // saved video chunks (service worker in script.js)
+        try { if ('caches' in window) { await caches.delete('kaeri-video-chunks-v1'); await caches.delete(UV_CACHE); } } catch (e) {}   // saved video chunks (service worker in script.js)
         console.log("Offline document cache purged.");
     } catch (e) {
         console.error("Failed to clear offline cache", e);
@@ -1650,11 +1711,13 @@ async function renderPdfFromBase64(base64Data, title) {
         if (typeof pdfjsLib === 'undefined') throw new Error('PDF.js not loaded');
 
         // Raw bytes (new offline format) or Base64 text (older saves)
-        const bytes = (typeof base64Data === 'string') ? _b64ToBytes(base64Data)
+        const streaming = !!(base64Data && base64Data.__kvOpts);          // streamed source (range transport)
+        const bytes = streaming ? null
+                    : (typeof base64Data === 'string') ? _b64ToBytes(base64Data)
                     : (base64Data instanceof Uint8Array ? base64Data : new Uint8Array(base64Data));
 
         // Load with PDF.js
-        const pdf = await pdfjsLib.getDocument({ data: bytes }).promise;
+        const pdf = await pdfjsLib.getDocument(streaming ? base64Data.__kvOpts : { data: bytes }).promise;
         if (myRenderId !== _docRenderId) return;   // viewer was closed meanwhile
         _docPdf = pdf;
         _docReaderInit(pdf.numPages);              // voice reader becomes available
@@ -1686,11 +1749,14 @@ async function renderPdfFromBase64(base64Data, title) {
 
         // Fire-and-forget analytics
         logAnalyticsEvent('document_view', `Viewed: ${title}`);
+        return true;
     } catch (err) {
         console.error(err);
         if (myRenderId !== _docRenderId) return;
+        if (base64Data && base64Data.__kvOpts) return false;     // streamed: the caller falls back to a full download
         if (loader) loader.style.display = 'none';
         container.innerHTML = '<p style="color:#dc3545; text-align:center;">Failed to render PDF. The file might be corrupted or not a PDF.</p>';
+        return false;
     }
 }
 
@@ -1774,6 +1840,124 @@ function _docProgressStop() {
     const wrap = document.getElementById('doc-progress-wrap');
     if (wrap) wrap.style.display = 'none';
     _docProgressRender();
+}
+
+
+// ============================================================
+// === SIZE-PROOF DOCUMENT DOWNLOAD (chunked, parallel, resumable) ===
+// Replaces the single giant Base64 response, which Apps Script cannot deliver for big files.
+// Each call returns one slice (3 MB). Slice 0 also tells us the total size.
+// ============================================================
+const DOC_CHUNK_BYTES = 3 * 1024 * 1024;     // multiple of 256 KB; Base64 makes it ~4 MB on the wire
+const DOC_PARALLEL = 3;                      // slices in flight at once
+const DOC_TRIES = 6;                         // attempts per slice
+let _docPartial = null;                      // { fileId, total, buf, done:Set, mime } kept after a failure so a re-open resumes
+
+function _docSleep(ms, signal) {
+    return new Promise((resolve, reject) => {
+        const t = setTimeout(resolve, ms);
+        if (signal) signal.addEventListener('abort', () => { clearTimeout(t); reject(new DOMException('Aborted', 'AbortError')); }, { once: true });
+    });
+}
+
+/** If the phone is offline, wait (up to maxMs) for it to come back instead of burning retries. */
+function _docWaitOnline(signal, maxMs) {
+    if (navigator.onLine) return Promise.resolve();
+    return new Promise((resolve, reject) => {
+        const done = () => { clearTimeout(t); window.removeEventListener('online', done); resolve(); };
+        const t = setTimeout(done, maxMs);
+        window.addEventListener('online', done, { once: true });
+        if (signal) signal.addEventListener('abort', () => { clearTimeout(t); window.removeEventListener('online', done); reject(new DOMException('Aborted', 'AbortError')); }, { once: true });
+    });
+}
+
+/** One slice, with retries. Stops early on a real denial (revoked, expired, wrong scope). */
+async function _docFetchChunk(fileId, session, start, signal, length, variant) {
+    let last = null;
+    for (let a = 0; a < DOC_TRIES; a++) {
+        await _docWaitOnline(signal, 30000);
+        try {
+            const res = await fetch(APPS_SCRIPT_URL, {
+                method: 'POST',
+                headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+                body: JSON.stringify({ action: 'get_document_chunk', file_id: fileId, start: start, length: length || DOC_CHUNK_BYTES, variant: variant || '', session: session }),
+                signal: signal
+            });
+            const j = await res.json();
+            if (j && j.success && j.data && typeof j.data.base64 === 'string' && j.data.start === start) return j.data;
+            last = j;
+            if (_isDefinitiveDenial(j) && !/temporar/i.test(String(j && j.message))) break;
+        } catch (e) {
+            if (e && e.name === 'AbortError') throw e;
+            last = { success: false, message: 'Network error' };
+        }
+        await _docSleep(Math.min(800 * Math.pow(2, a), 8000), signal);
+    }
+    const err = new Error((last && last.message) || 'Download failed');
+    err.reply = last;
+    throw err;
+}
+
+/** Download the whole document as a Uint8Array, any size. Throws (with .reply) on denial or exhausted retries. */
+async function _downloadDocChunked(fileId, session, signal, variant) {
+    _docProgressStart();
+    let part = (_docPartial && _docPartial.fileId === fileId + '|' + (variant || '')) ? _docPartial : null;
+
+    if (!part) {
+        const first = await _docFetchChunk(fileId, session, 0, signal, DOC_CHUNK_BYTES, variant);
+        let buf;
+        try { buf = new Uint8Array(first.total); }
+        catch (e) { throw new Error('This file is too large for this device\'s memory'); }
+        const bytes0 = _b64ToBytes(first.base64);
+        buf.set(bytes0, 0);
+        part = _docPartial = { fileId: fileId + '|' + (variant || ''), total: first.total, buf: buf, done: new Set([0]), mime: first.mimeType };
+    }
+
+    const total = part.total;
+    const count = Math.ceil(total / DOC_CHUNK_BYTES);
+    _docProg.stage = 'transfer';
+    _docProg.total = total;
+    const gotBytes = () => { let n = 0; part.done.forEach(i => { n += Math.min(DOC_CHUNK_BYTES, total - i * DOC_CHUNK_BYTES); }); return n; };
+    _docProg.got = gotBytes();
+
+    const todo = [];
+    for (let i = 0; i < count; i++) if (!part.done.has(i)) todo.push(i);
+    let next = 0, failure = null;
+
+    async function worker() {
+        while (!failure) {
+            const n = next++;
+            if (n >= todo.length) return;
+            const idx = todo[n];
+            try {
+                const d = await _docFetchChunk(fileId, session, idx * DOC_CHUNK_BYTES, signal, DOC_CHUNK_BYTES, variant);
+                if (d.total !== total) throw new Error('The file changed on the server. Please open it again.');
+                const bytes = _b64ToBytes(d.base64);
+                const expected = Math.min(DOC_CHUNK_BYTES, total - idx * DOC_CHUNK_BYTES);
+                if (bytes.length !== expected) throw new Error('Received an incomplete part');
+                part.buf.set(bytes, idx * DOC_CHUNK_BYTES);
+                part.done.add(idx);
+                _docProg.got = gotBytes();
+            } catch (e) {
+                if (!failure) failure = e;
+                return;
+            }
+        }
+    }
+    await Promise.all(Array.from({ length: Math.min(DOC_PARALLEL, todo.length) }, worker));
+    if (failure) {
+        if (failure.message && /file changed/i.test(failure.message)) _docPartial = null;   // stale partial: start over next time
+        throw failure;
+    }
+
+    if (part.done.size !== count) throw new Error('Download incomplete');
+    const out = part.buf;
+    _docPartial = null;
+    // Integrity check: a PDF starts with "%PDF"
+    if (out.length < 5 || out[0] !== 0x25 || out[1] !== 0x50 || out[2] !== 0x44 || out[3] !== 0x46) {
+        throw new Error('The downloaded file is not a valid PDF');
+    }
+    return out;
 }
 
 /** POST to the Gatekeeper and stream the response so the bar can show real progress. Returns the parsed JSON. */
@@ -2472,6 +2656,7 @@ function _docBindViewerEvents() {
     _docBindImmersive();
     if (!c || c._kvBound) return;
     c._kvBound = true;
+    try { c.focus({ preventScroll: true }); } catch (e) {}   // so the arrow / PgUp / PgDn / Space keys scroll the document
     let raf = 0;
     c.addEventListener('scroll', function () {
         if (raf) return;
@@ -2573,6 +2758,85 @@ function _docOnResize() {
 window.addEventListener('resize', _docOnResize);
 window.addEventListener('orientationchange', _docOnResize);
 
+// ---------- PC keyboard shortcuts (while a document is open) ----------
+function docHelpToggle() {
+    const h = document.getElementById('doc-help');
+    if (!h) return;
+    const open = h.style.display === 'flex';
+    h.style.display = open ? 'none' : 'flex';
+    if (open) { const c = document.getElementById('pdf-canvas-container'); try { c && c.focus({ preventScroll: true }); } catch (e) {} }
+}
+
+function docReaderSpeedStep(dir) {
+    let i = 0, best = 99;
+    _DOC_RATES.forEach(function (r, k) { const d = Math.abs(r - ttsRate); if (d < best) { best = d; i = k; } });
+    i = Math.min(_DOC_RATES.length - 1, Math.max(0, i + dir));
+    setTtsRate(_DOC_RATES[i]);
+    _docReaderSyncUi();
+}
+
+window.addEventListener('keydown', function (e) {
+    if (!_docViewerOpen()) return;
+    if (e.ctrlKey || e.metaKey || e.altKey || e.isComposing) return;   // never hijack browser shortcuts
+    const help = document.getElementById('doc-help');
+    const jump = document.getElementById('doc-jump');
+    const stop = function () { e.preventDefault(); e.stopPropagation(); };
+
+    if (e.key === 'Escape') {                                          // innermost layer first
+        if (help && help.style.display === 'flex') { stop(); docHelpToggle(); }
+        else if (jump && jump.style.display === 'flex') { stop(); docJumpClose(); }
+        return;                                                        // otherwise the normal Esc closes the viewer
+    }
+    if (_isTypingTarget(e.target)) return;                             // typing a page number: keys belong to the box
+    if (!_docPdf) { if (e.key === '?' ) { stop(); docHelpToggle(); } return; }
+    if (help && help.style.display === 'flex') { if (e.key === '?' || e.key === 'h' || e.key === 'H') { stop(); docHelpToggle(); } return; }
+
+    const total = _docReader.total || 1;
+    const cur = _docReader.active ? _docReader.page : _docVisiblePage();
+    switch (e.key) {
+        case 'ArrowRight': case 'n': case 'N': stop(); docReaderStep(1); break;
+        case 'ArrowLeft':  case 'p': case 'P': stop(); docReaderStep(-1); break;
+        case 'Home': stop(); docJumpTo(1); break;
+        case 'End':  stop(); docJumpTo(total); break;
+        case 'g': case 'G': case '/': {
+            stop();
+            if (jump && jump.style.display !== 'flex') docJumpToggle();
+            const inp = document.getElementById('dj-input');
+            if (inp) { inp.focus(); try { inp.select(); } catch (er) {} }
+            break;
+        }
+        case 'k': case 'K': stop(); docReaderToggle(); break;
+        case 's': case 'S': stop(); docReaderStop(); break;
+        case '+': case '=': stop(); docReaderSpeedStep(1); break;
+        case '-': case '_': stop(); docReaderSpeedStep(-1); break;
+        case 'f': case 'F': stop(); docToggleFullscreen(); break;
+        case '?': case 'h': case 'H': stop(); docHelpToggle(); break;
+        default: break;   // arrows up/down, PgUp/PgDn, Space: native scrolling of the focused document
+    }
+}, true);
+
+// ---------- Print protection (while a document is open) ----------
+function _docViewerOpen() {
+    const v = document.getElementById('smart-doc-viewer');
+    return !!(v && v.style.display && v.style.display !== 'none');
+}
+// Ctrl/Cmd+P (and the browser menu, via beforeprint) must never produce the document
+window.addEventListener('keydown', function (e) {
+    if ((e.ctrlKey || e.metaKey) && !e.altKey && (e.key === 'p' || e.key === 'P') && _docViewerOpen()) {
+        e.preventDefault(); e.stopPropagation();
+        showAppNotification('🔒 Printing is disabled for protected documents.', 'warning', 2500);
+    }
+}, true);
+window.addEventListener('beforeprint', function () {
+    if (_docViewerOpen()) document.body.classList.add('kv-doc-open');   // belt and braces: the print CSS keys off this class
+});
+document.addEventListener('contextmenu', function (e) {
+    if (_docViewerOpen() && e.target && e.target.closest && e.target.closest('#pdf-canvas-container')) e.preventDefault();
+});
+document.addEventListener('dragstart', function (e) {
+    if (_docViewerOpen() && e.target && e.target.closest && e.target.closest('#pdf-canvas-container')) e.preventDefault();
+});
+
 function _docIsFullscreen() { return !!(document.fullscreenElement || document.webkitFullscreenElement); }
 
 function docToggleFullscreen() {
@@ -2622,8 +2886,10 @@ function closeDocViewer() {
     const viewer = document.getElementById('smart-doc-viewer');
     if (viewer) {
         _docExitFullscreen();
+        document.body.classList.remove('kv-doc-open');
         viewer.style.display = 'none';
         _docRenderId++;   // stop any in-flight PDF render
+        _uvRelease();     // stop streaming, free blobs, remove the save chip
         _docResetUi();    // cancel a running download, stop the progress bar and the voice reader
         const container = document.getElementById('pdf-canvas-container');
         if (container) container.innerHTML = "";
@@ -2638,6 +2904,464 @@ function closeDocViewer() {
 // Document access bouncer — shows skeleton INSTANTLY, verifies, then renders.
 // PDFs are downloaded through the Gatekeeper, cached in IndexedDB, and drawn by PDF.js.
 // A cached file is NEVER read before the access check passes (online: server, offline: local expiry).
+// ============================================================================
+// === UNIVERSAL DOCUMENT VIEWER (any size, any file) =========================
+// PDF      : streamed with PDF.js range requests. Only the pages on screen are fetched,
+//            so a 500 MB PDF opens as fast as a 1 MB one and uses almost no memory.
+// Office   : converted to PDF by the Gatekeeper (cached) and streamed the same way.
+//            If conversion is impossible: in-browser fallbacks (docx, xlsx/csv, pptx text).
+// Image / video / audio / text : native renderers.
+// Everything that is read is kept in Cache Storage, so it also opens offline.
+// ============================================================================
+const UV_CHUNK = 2 * 1024 * 1024;                 // multiple of 256 KB
+const UV_CACHE = 'kaeri-doc-chunks-v1';
+const UV_MEM_MAX = 10;                            // parts kept in RAM (about 20 MB)
+const UV_PAR = 4;                                 // parts in flight at once
+const UV_AUTOSAVE_MAX = 25 * 1024 * 1024;         // up to this size, save for offline automatically
+let _uvSrc = null;
+let _uvObjUrls = [];
+let _uvOpenSeq = 0;
+
+function _uvKey(id, part, idx) {
+    return new Request(location.origin + '/__kdoc__/' + encodeURIComponent(id) + '/' + part + (idx === undefined ? '' : '/' + idx));
+}
+function _uvNorm(j) { return Object.assign({}, j || {}, { code: (j && (j.code || (j.data && j.data.code))) || undefined }); }
+function _uvIsDenial(j) {
+    if (!j) return false;
+    const c = j.code || (j.data && j.data.code), m = String(j.message || '');
+    if (c === 'SESSION_INVALID' || c === 'SCOPE_DENIED') return true;
+    return /revoked|expired|mismatch|denied|not found|different account/i.test(m) && !/temporar/i.test(m);
+}
+function _uvExt(name) { const m = String(name || '').toLowerCase().match(/\.([a-z0-9]+)$/); return m ? m[1] : ''; }
+
+class UvSource {
+    constructor(fileId, session, info, offlineOnly) {
+        this.id = fileId; this.session = session; this.info = info;
+        this.total = info.total; this.variant = info.variant || '';
+        this.count = Math.ceil(info.total / UV_CHUNK);
+        this.part = 'c-' + (this.variant || 'raw');
+        this.mem = new Map(); this.inflight = new Map();
+        this.active = 0; this.waiters = [];
+        this.ctl = new AbortController(); this.closed = false;
+        this.cacheOk = true; this.offlineOnly = !!offlineOnly;
+    }
+    get signal() { return this.ctl.signal; }
+    close() { this.closed = true; try { this.ctl.abort(); } catch (e) {} this.mem.clear(); this.inflight.clear(); }
+
+    async _slot() {
+        if (this.active < UV_PAR) { this.active++; return; }
+        await new Promise(r => this.waiters.push(r));      // the releasing call hands its slot over
+    }
+    _release() { const w = this.waiters.shift(); if (w) w(); else this.active--; }
+    _remember(idx, bytes) {
+        this.mem.delete(idx); this.mem.set(idx, bytes);
+        while (this.mem.size > UV_MEM_MAX) this.mem.delete(this.mem.keys().next().value);
+    }
+    _expected(idx) { return Math.min(UV_CHUNK, this.total - idx * UV_CHUNK); }
+
+    async _fromCache(idx) {
+        try {
+            if (!('caches' in window)) return null;
+            const hit = await (await caches.open(UV_CACHE)).match(_uvKey(this.id, this.part, idx));
+            if (!hit) return null;
+            const b = new Uint8Array(await hit.arrayBuffer());
+            return b.length === this._expected(idx) ? b : null;
+        } catch (e) { return null; }
+    }
+    async _toCache(idx, bytes) {
+        try {
+            if (!('caches' in window)) { this.cacheOk = false; return; }
+            await (await caches.open(UV_CACHE)).put(_uvKey(this.id, this.part, idx), new Response(bytes, { headers: { 'Content-Type': 'application/octet-stream' } }));
+        } catch (e) { this.cacheOk = false; }          // storage full: viewing still works, it just is not saved
+    }
+    async has(idx) {
+        try { return !!(await (await caches.open(UV_CACHE)).match(_uvKey(this.id, this.part, idx))); } catch (e) { return false; }
+    }
+    async saveMeta() {
+        try {
+            if (!('caches' in window)) return;
+            const meta = { total: this.total, mime: this.info.mime, kind: this.info.kind, variant: this.variant, name: this.info.name, origKind: this.info.origKind || '', origName: this.info.origName || '' };
+            await (await caches.open(UV_CACHE)).put(_uvKey(this.id, 'meta'), new Response(JSON.stringify(meta), { headers: { 'Content-Type': 'application/json' } }));
+        } catch (e) {}
+    }
+
+    /** One part (2 MB) of the file: RAM, then device cache, then network (retried). */
+    async chunk(idx) {
+        if (this.closed) throw new DOMException('Aborted', 'AbortError');
+        if (idx < 0 || idx >= this.count) throw new Error('Part out of range');
+        if (this.mem.has(idx)) { const v = this.mem.get(idx); this._remember(idx, v); return v; }
+        if (this.inflight.has(idx)) return this.inflight.get(idx);
+        const p = (async () => {
+            const cached = await this._fromCache(idx);
+            if (cached) return cached;
+            if (this.offlineOnly) throw new Error('This part is not saved for offline use');
+            await this._slot();
+            try {
+                const d = await _docFetchChunk(this.id, this.session, idx * UV_CHUNK, this.signal, UV_CHUNK, this.variant);
+                if (d.total !== this.total) throw new Error('The file changed on the server. Please open it again.');
+                const bytes = _b64ToBytes(d.base64);
+                if (bytes.length !== this._expected(idx)) throw new Error('Received an incomplete part');
+                await this._toCache(idx, bytes);
+                return bytes;
+            } finally { this._release(); }
+        })().then(b => { this._remember(idx, b); return b; });
+        this.inflight.set(idx, p);
+        try { return await p; } finally { this.inflight.delete(idx); }
+    }
+
+    /** Bytes [begin, end) as a fresh Uint8Array. */
+    async read(begin, end) {
+        end = Math.min(end, this.total);
+        if (!(end > begin)) return new Uint8Array(0);
+        const first = Math.floor(begin / UV_CHUNK), last = Math.floor((end - 1) / UV_CHUNK);
+        const idxs = []; for (let i = first; i <= last; i++) idxs.push(i);
+        const parts = await Promise.all(idxs.map(i => this.chunk(i)));
+        const out = new Uint8Array(end - begin);
+        parts.forEach((b, k) => {
+            const base = (first + k) * UV_CHUNK;
+            const from = Math.max(begin, base) - base, to = Math.min(end, base + b.length) - base;
+            out.set(b.subarray(from, to), Math.max(begin, base) - begin);
+        });
+        return out;
+    }
+
+    /** Save every part on the device (2 parallel). Resolves true when all parts are stored. */
+    async fillAll(onProgress) {
+        const missing = [];
+        for (let i = 0; i < this.count; i++) if (!(await this.has(i))) missing.push(i);
+        let done = this.count - missing.length, next = 0, failed = null;
+        onProgress(done, this.count);
+        const worker = async () => {
+            while (!failed && !this.closed) {
+                const n = next++; if (n >= missing.length) return;
+                try { await this.chunk(missing[n]); done++; onProgress(done, this.count); }
+                catch (e) { failed = e; }
+            }
+        };
+        await Promise.all([worker(), worker()]);
+        if (failed) throw failed;
+        if (this.closed) throw new DOMException('Aborted', 'AbortError');
+        return this.cacheOk;
+    }
+}
+
+/** What is saved on this device for a document: { meta, complete } or null. */
+async function _uvSavedInfo(fileId) {
+    try {
+        if (!('caches' in window)) return null;
+        const cache = await caches.open(UV_CACHE);
+        const mr = await cache.match(_uvKey(fileId, 'meta'));
+        if (!mr) return null;
+        const meta = await mr.json();
+        const part = 'c-' + (meta.variant || 'raw'), count = Math.ceil(meta.total / UV_CHUNK);
+        for (let i = 0; i < count; i++) if (!(await cache.match(_uvKey(fileId, part, i)))) return { meta, complete: false };
+        return { meta, complete: true };
+    } catch (e) { return null; }
+}
+
+/** Free everything the viewer holds: the streaming source, blob URLs, the save chip. */
+function _uvRelease() {
+    if (_uvSrc) { try { _uvSrc.close(); } catch (e) {} _uvSrc = null; }
+    _uvObjUrls.forEach(u => { try { URL.revokeObjectURL(u); } catch (e) {} });
+    _uvObjUrls = [];
+    const chip = document.getElementById('kv-uv-chip');
+    if (chip) chip.remove();
+}
+
+/** Ask the Gatekeeper to authorise + classify (and convert Office files). */
+async function _uvPrepare(fileId, session, signal) {
+    let last = null;
+    for (let a = 0; a < 4; a++) {
+        await _docWaitOnline(signal, 30000);
+        try {
+            const res = await fetch(APPS_SCRIPT_URL, {
+                method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+                body: JSON.stringify({ action: 'prepare_document_view', file_id: fileId, session: session }), signal: signal
+            });
+            const j = await res.json();
+            if (j && j.success && j.data && j.data.total > 0) return j.data;
+            last = j;
+            if (_uvIsDenial(j)) break;
+        } catch (e) {
+            if (e && e.name === 'AbortError') throw e;
+            last = { success: false, message: 'Network error' };
+        }
+        await _docSleep(1000 * (a + 1), signal);
+    }
+    const err = new Error((last && last.message) || 'Could not open this document');
+    err.reply = _uvNorm(last);
+    throw err;
+}
+
+// ---------- small UI helpers ----------
+function _uvBox() { return document.getElementById('pdf-canvas-container'); }
+function _uvDone() {
+    _docProgressFinish();
+    const loader = document.getElementById('doc-loader-overlay');
+    if (loader) loader.style.display = 'none';
+}
+function _uvTitle(text) { const t = document.getElementById('viewer-title'); if (t) t.textContent = text; }
+function _uvTrack(blob) { const u = URL.createObjectURL(blob); _uvObjUrls.push(u); return u; }
+
+async function _uvDownloadBlob(src) {
+    _docProg.stage = 'transfer'; _docProg.total = src.total; _docProg.got = 0;
+    const parts = new Array(src.count);
+    let next = 0, failed = null;
+    const worker = async () => {
+        while (!failed) {
+            const i = next++; if (i >= src.count) return;
+            try { parts[i] = await src.chunk(i); _docProg.got += parts[i].length; }
+            catch (e) { failed = e; }
+        }
+    };
+    await Promise.all(Array.from({ length: Math.min(UV_PAR, src.count) }, worker));
+    if (failed) throw failed;
+    return new Blob(parts, { type: src.info.mime || 'application/octet-stream' });
+}
+
+// ---------- PDF: streamed ----------
+async function _uvRenderPdf(src, title) {
+    if (typeof pdfjsLib === 'undefined' || !pdfjsLib.PDFDataRangeTransport) return false;
+    const first = await src.chunk(0);
+    const rt = new pdfjsLib.PDFDataRangeTransport(src.total, first.slice(0, Math.min(first.length, src.total)));
+    rt.requestDataRange = function (begin, end) {
+        (async () => {
+            while (!src.closed) {
+                try { rt.onDataRange(begin, await src.read(begin, end)); return; }
+                catch (e) {
+                    if (src.closed || (e && e.name === 'AbortError')) return;
+                    if (_uvIsDenial(e && e.reply)) { _denyDocAccess(_uvNorm(e.reply)); return; }
+                    await _docSleep(2500).catch(() => {});      // connection lost: keep trying, pages appear when it returns
+                }
+            }
+        })();
+    };
+    const ok = await renderPdfFromBase64({ __kvOpts: { range: rt, length: src.total, disableAutoFetch: true, disableStream: true, rangeChunkSize: 524288 } }, title);
+    return ok !== false;
+}
+
+// ---------- images / video / audio ----------
+async function _uvRenderMedia(src, title) {
+    const blob = await _uvDownloadBlob(src);
+    const url = _uvTrack(blob), box = _uvBox(), kind = src.info.kind;
+    box.innerHTML = '';
+    let el;
+    if (kind === 'image') {
+        el = document.createElement('img');
+        el.alt = title; el.src = url;
+        el.style.cssText = 'width:100%;max-width:980px;height:auto;background:#fff;touch-action:pinch-zoom;cursor:zoom-in;';
+        let zoomed = false;
+        el.onclick = function () { zoomed = !zoomed; el.style.maxWidth = zoomed ? 'none' : '980px'; el.style.width = zoomed ? '200%' : '100%'; el.style.cursor = zoomed ? 'zoom-out' : 'zoom-in'; };
+        box.style.overflowX = 'auto';
+    } else {
+        el = document.createElement(kind === 'audio' ? 'audio' : 'video');
+        el.controls = true; el.playsInline = true; el.src = url;
+        el.style.cssText = 'width:100%;max-width:980px;background:#000;';
+        el.setAttribute('controlsList', 'nodownload');
+        el.oncontextmenu = function (e) { e.preventDefault(); };
+    }
+    box.appendChild(el);
+    _uvDone();
+    logAnalyticsEvent('document_view', 'Viewed: ' + title);
+}
+
+// ---------- text / csv ----------
+function _uvParseCsv(text, delim, maxRows) {
+    const rows = []; let row = [], cell = '', q = false;
+    for (let i = 0; i < text.length && rows.length < maxRows; i++) {
+        const c = text[i];
+        if (q) {
+            if (c === '"') { if (text[i + 1] === '"') { cell += '"'; i++; } else q = false; } else cell += c;
+        } else if (c === '"') q = true;
+        else if (c === delim) { row.push(cell); cell = ''; }
+        else if (c === '\n') { row.push(cell.replace(/\r$/, '')); rows.push(row); row = []; cell = ''; }
+        else cell += c;
+    }
+    if ((cell || row.length) && rows.length < maxRows) { row.push(cell); rows.push(row); }
+    return rows;
+}
+
+async function _uvRenderText(src, title) {
+    const MAX = 5 * 1024 * 1024;
+    const n = Math.min(src.total, MAX);
+    const text = new TextDecoder('utf-8').decode(await src.read(0, n));
+    const box = _uvBox(), ext = _uvExt(src.info.name);
+    box.innerHTML = '';
+    const wrap = document.createElement('div');
+    wrap.style.cssText = 'width:100%;max-width:980px;background:#fff;color:#111;border-radius:6px;padding:12px;box-sizing:border-box;overflow:auto;';
+    if (ext === 'csv' || ext === 'tsv') {
+        const rows = _uvParseCsv(text, ext === 'tsv' ? '\t' : ',', 2000);
+        const table = document.createElement('table');
+        table.style.cssText = 'border-collapse:collapse;font-size:13px;';
+        rows.forEach((r, ri) => {
+            const tr = document.createElement('tr');
+            r.forEach(v => { const td = document.createElement(ri === 0 ? 'th' : 'td'); td.textContent = v; td.style.cssText = 'border:1px solid #ccc;padding:4px 8px;text-align:left;white-space:nowrap;'; tr.appendChild(td); });
+            table.appendChild(tr);
+        });
+        wrap.appendChild(table);
+    } else {
+        const pre = document.createElement('pre');
+        pre.style.cssText = 'white-space:pre-wrap;word-break:break-word;margin:0;font-size:14px;line-height:1.5;font-family:ui-monospace,Menlo,Consolas,monospace;';
+        pre.textContent = text;
+        wrap.appendChild(pre);
+    }
+    if (src.total > MAX) {
+        const note = document.createElement('div');
+        note.style.cssText = 'margin-top:10px;color:#a60;font-size:12px;';
+        note.textContent = 'Showing the first ' + _fmtBytes(MAX) + ' of ' + _fmtBytes(src.total) + '.';
+        wrap.appendChild(note);
+    }
+    box.appendChild(wrap);
+    _uvDone();
+    logAnalyticsEvent('document_view', 'Viewed: ' + title);
+}
+
+// ---------- Office files when server conversion was not possible ----------
+function _uvLoadScript(url) {
+    return new Promise((resolve, reject) => {
+        const s = document.createElement('script');
+        s.src = url; s.onload = resolve; s.onerror = () => reject(new Error('Viewer component could not load (needs internet once)'));
+        document.head.appendChild(s);
+    });
+}
+function _uvShowHtml(html) {
+    const box = _uvBox(); box.innerHTML = '';
+    const f = document.createElement('iframe');
+    f.setAttribute('sandbox', '');                       // no scripts, no same-origin: file content can never run code
+    f.style.cssText = 'width:100%;max-width:980px;flex:1;min-height:60vh;border:none;background:#fff;border-radius:6px;';
+    f.srcdoc = '<meta name="viewport" content="width=device-width,initial-scale=1"><style>body{font-family:system-ui,sans-serif;padding:16px;color:#111;background:#fff;line-height:1.5}table{border-collapse:collapse}td,th{border:1px solid #ccc;padding:4px 8px}img{max-width:100%}h2{color:#0d47a1}.slide{border:1px solid #ccc;border-radius:8px;padding:12px;margin:12px 0}</style>' + html;
+    box.appendChild(f);
+}
+function _uvEsc(t) { return String(t == null ? '' : t).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
+
+async function _uvRenderOfficeClient(src, title) {
+    if (src.total > 60 * 1024 * 1024) throw new Error('too large for the in-app fallback');
+    const ext = _uvExt(src.info.name);
+    const buf = await (await _uvDownloadBlob(src)).arrayBuffer();
+    if (ext === 'docx') {
+        await _uvLoadScript('https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js');
+        const r = await mammoth.convertToHtml({ arrayBuffer: buf });
+        _uvShowHtml(r.value || '<p>(empty document)</p>');
+    } else if (ext === 'xlsx' || ext === 'xls' || ext === 'ods') {
+        await _uvLoadScript('https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js');
+        const wb = XLSX.read(buf, { type: 'array' });
+        let html = '';
+        wb.SheetNames.slice(0, 8).forEach(name => {
+            const ws = wb.Sheets[name];
+            if (ws['!ref']) { const rg = XLSX.utils.decode_range(ws['!ref']); if (rg.e.r > 1999) { rg.e.r = 1999; ws['!ref'] = XLSX.utils.encode_range(rg); } }
+            html += '<h2>' + _uvEsc(name) + '</h2>' + XLSX.utils.sheet_to_html(ws);
+        });
+        _uvShowHtml(html);
+    } else if (ext === 'pptx') {
+        await _uvLoadScript('https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js');
+        const zip = await JSZip.loadAsync(buf);
+        const names = Object.keys(zip.files).filter(n => /^ppt\/slides\/slide\d+\.xml$/.test(n)).sort((a, b) => parseInt(a.match(/(\d+)\.xml$/)[1], 10) - parseInt(b.match(/(\d+)\.xml$/)[1], 10));
+        if (!names.length) throw new Error('no slides found');
+        let html = '';
+        for (let i = 0; i < names.length; i++) {
+            const xml = await zip.file(names[i]).async('string');
+            const paras = (xml.match(/<a:p>[\s\S]*?<\/a:p>|<a:p [\s\S]*?<\/a:p>/g) || []).map(p => (p.match(/<a:t>([^<]*)<\/a:t>/g) || []).map(t => t.replace(/<\/?a:t>/g, '')).join('')).filter(Boolean);
+            html += '<div class="slide"><h2>Slide ' + (i + 1) + '</h2>' + paras.map(p => '<p>' + _uvEsc(p) + '</p>').join('') + '</div>';
+        }
+        _uvShowHtml('<p style="color:#a60">Text view of the slides.</p>' + html);
+    } else {
+        throw new Error('no in-app renderer for .' + ext);
+    }
+    _uvDone();
+    logAnalyticsEvent('document_view', 'Viewed: ' + title);
+}
+
+// ---------- the last resort: never a blank screen ----------
+function _uvLastResort(fileId, title, mime, reason) {
+    _docProgressStop();
+    const loader = document.getElementById('doc-loader-overlay');
+    if (loader) loader.style.display = 'none';
+    const box = _uvBox(); if (!box) return;
+    box.innerHTML = '';
+    const card = document.createElement('div');
+    card.style.cssText = 'margin:auto;max-width:420px;text-align:center;color:#fff;padding:24px;background:#2b3a55;border-radius:12px;';
+    card.innerHTML = '<div style="font-size:42px">📄</div><h3 style="margin:10px 0 6px">This file can’t be shown right now</h3><p style="color:#c9d3e6;font-size:14px;margin:0 0 16px"></p>';
+    card.querySelector('p').textContent = reason || 'Something went wrong while opening it.';
+    const btn = document.createElement('button');
+    btn.textContent = '↻ Try again';
+    btn.style.cssText = 'background:#ffc107;color:#222;border:none;border-radius:8px;padding:10px 20px;font-weight:bold;font-size:15px;';
+    btn.onclick = function () { attemptOpenDoc(fileId, title, mime); };
+    card.appendChild(btn);
+    box.appendChild(card);
+}
+
+// ---------- offline save chip ----------
+function _uvOfferSave(src) {
+    if (!('caches' in window) || src.offlineOnly) return;
+    const host = document.querySelector('#smart-doc-viewer .dv-box');
+    if (!host) return;
+    const old = document.getElementById('kv-uv-chip'); if (old) old.remove();
+    const chip = document.createElement('button');
+    chip.id = 'kv-uv-chip';
+    chip.style.cssText = 'position:absolute;right:10px;bottom:34px;z-index:6;background:rgba(13,27,42,.92);color:#fff;border:1px solid #72efdd;border-radius:16px;padding:5px 12px;font-size:12px;font-weight:bold;';
+    host.appendChild(chip);
+    const start = async function () {
+        chip.disabled = true;
+        try {
+            const ok = await src.fillAll((d, c) => { chip.textContent = '⬇ ' + Math.floor((d / c) * 100) + '%'; });
+            if (ok === false) throw new Error('quota');
+            chip.textContent = '✅ Saved offline';
+            await src.saveMeta();
+            _reportOfflineSave(true);
+        } catch (e) {
+            if (e && e.name === 'AbortError') return;
+            chip.disabled = false;
+            chip.textContent = (e && e.message === 'quota') ? '⚠ Phone storage full' : '⚠ Retry save';
+        }
+    };
+    chip.onclick = start;
+    (async function () {
+        const saved = await _uvSavedInfo(src.id);
+        if (saved && saved.complete) { chip.textContent = '✅ Saved offline'; chip.disabled = true; }
+        else if (src.total <= UV_AUTOSAVE_MAX) start();
+        else chip.textContent = '⬇ Save offline (' + _fmtBytes(src.total) + ')';
+    })();
+}
+
+/** Show a prepared document. Picks the renderer by kind, with fallbacks so the student never sees a dead end. */
+async function _uvShow(src, title, mimeType) {
+    _uvRelease();
+    _uvSrc = src;
+    src.saveMeta();
+    const kind = src.info.kind, fileId = src.id;
+    const loaderText = document.getElementById('doc-loader-text');
+    try {
+        if (kind === 'pdf') {
+            if (loaderText) loaderText.textContent = 'Opening...';
+            let ok = false;
+            try { ok = await _uvRenderPdf(src, title); } catch (e) { if (e && (e.name === 'AbortError' || _uvIsDenial(e.reply))) throw e; ok = false; }
+            if (!ok && !src.closed) {                    // streaming unavailable: classic full download, still in parts
+                if (loaderText) loaderText.textContent = 'Downloading securely...';
+                const bytes = await _downloadDocChunked(fileId, src.session, src.signal, src.variant);
+                const saved = await saveDocOffline(fileId, bytes.buffer.slice(0));
+                _reportOfflineSave(saved);
+                if ((await renderPdfFromBase64(bytes, title)) === false) throw new Error('This PDF could not be displayed.');
+            }
+            _uvOfferSave(src);
+        } else if (kind === 'image' || kind === 'video' || kind === 'audio') {
+            await _uvRenderMedia(src, title);
+            _uvOfferSave(src);
+        } else if (kind === 'text') {
+            await _uvRenderText(src, title);
+        } else if (kind === 'office') {
+            await _uvRenderOfficeClient(src, title);     // conversion failed server-side
+        } else {
+            throw new Error('This file type has no built-in viewer yet.');
+        }
+    } catch (e) {
+        if (e && e.name === 'AbortError') return;
+        if (src.closed) return;
+        if (e && e.reply && _uvIsDenial(e.reply)) { _denyDocAccess(_uvNorm(e.reply)); return; }
+        console.warn('[VIEWER]', e);
+        _uvLastResort(fileId, title, mimeType, (e && e.message) ? e.message : '');
+    }
+}
+
 async function attemptOpenDoc(fileId, title, mimeType) {
     if (!hasFullAccess) {
         // Free user: show message and payment modal
@@ -2648,15 +3372,34 @@ async function attemptOpenDoc(fileId, title, mimeType) {
         return;
     }
 
-    const isPdf = !mimeType || String(mimeType).toLowerCase().includes('pdf');
     _docOpenFileId = fileId;
     const sessionPayload = { code: userCode, email: userEmail };
     const loaderText = () => document.getElementById('doc-loader-text');
 
     // ── 1. INSTANT FEEDBACK: show the viewer + shimmer right now ──
     showDocViewerLoading(title);
+    const mySeq = ++_uvOpenSeq;
+    const stale = () => mySeq !== _uvOpenSeq || !_docViewerOpen();
 
-    // ── 2. OFFLINE: local expiry check (the "bouncer"), then the IndexedDB cache ──
+    // Opens a copy kept on this device (new part store first, then the older IndexedDB copy).
+    async function openSaved() {
+        const saved = await _uvSavedInfo(fileId);
+        if (saved && saved.complete && !stale()) {
+            const src = new UvSource(fileId, sessionPayload, saved.meta, true);
+            if (loaderText()) loaderText().textContent = 'Loading from offline cache...';
+            await _uvShow(src, title, mimeType);
+            return true;
+        }
+        const legacy = await getOfflineDoc(fileId);
+        if (legacy && !stale()) {
+            if (loaderText()) loaderText().textContent = 'Loading from offline cache...';
+            renderPdfFromBase64(legacy, title);
+            return true;
+        }
+        return false;
+    }
+
+    // ── 2. OFFLINE: local expiry check (the "bouncer"), then the device copy ──
     if (!navigator.onLine) {
         const expiry = parseInt(localStorage.getItem(`expiry_${currentTermKey}`), 10);
         if (!expiry || Date.now() >= expiry) {
@@ -2664,100 +3407,53 @@ async function attemptOpenDoc(fileId, title, mimeType) {
             showAppNotification("⏳ Session expired. Connect to internet to verify.", "warning");
             return;
         }
-        if (!isPdf) {
+        if (!(await openSaved())) {
             closeDocViewer();
-            showAppNotification("📡 You are offline. This file type needs an internet connection.", "warning");
-            return;
-        }
-        const offlineCopy = await getOfflineDoc(fileId);
-        if (offlineCopy) {
-            if (loaderText()) loaderText().textContent = 'Loading from offline cache...';
-            renderPdfFromBase64(offlineCopy, title);
-        } else {
-            closeDocViewer();
-            showAppNotification("📡 You are offline and haven't viewed this document before.", "warning");
+            showAppNotification("📡 You are offline and haven't saved this document yet.", "warning");
         }
         return;
     }
 
+    // ── 3. ONLINE: the Gatekeeper verifies access, identifies the file and (for Office files) converts it ──
     try {
-        // ── 3. ONLINE, non-PDF (video / PPTX / Word): verify, then Drive preview iframe (not cached) ──
-        if (!isPdf) {
-            const vres = await fetch(APPS_SCRIPT_URL, {
-                method: 'POST',
-                headers: { "Content-Type": "text/plain;charset=utf-8" },
-                body: JSON.stringify({ action: 'verify_document_access', file_id: fileId, session: sessionPayload })
-            });
-            const vdata = await vres.json();
-            if (vdata.success) {
-                showAppNotification("📄 Previewing Office/Video files requires an internet connection.", "info");
-                loadNonPdfPreview(fileId, title);
-            } else {
-                _denyDocAccess(vdata);
-            }
+        _docAbort = new AbortController();
+        const ab = _docAbort;
+        _docProgressStart();
+        if (loaderText()) loaderText().textContent = 'Preparing document...';
+
+        let info;
+        try {
+            info = await _uvPrepare(fileId, sessionPayload, ab.signal);
+        } catch (e) {
+            if (e && e.name === 'AbortError') return;
+            if (e && e.reply && _uvIsDenial(e.reply)) { _denyDocAccess(_uvNorm(e.reply)); return; }
+            // A hiccup (slow network, Apps Script error) must not lock out a paying student:
+            // a copy already on the device opens while the local licence is still valid.
+            if (_localExpiryValid() && await openSaved()) return;
+            _docProgressStop();
+            closeDocViewer();
+            showAppNotification("⚠️ Connection error. Could not load the document.", "error");
             return;
         }
+        if (ab.signal.aborted || stale()) return;
 
-        // ── 4. ONLINE, PDF: if cached, still verify with the server before reading the cache ──
-        const cachedCopy = await getOfflineDoc(fileId);
-        if (cachedCopy) {
-            if (loaderText()) loaderText().textContent = 'Verifying access...';
-            // A definitive "no" from the server (revoked, expired, wrong account, document removed) blocks the file.
-            // A hiccup (Apps Script error, slow or flaky network) must NOT: then the local expiry decides.
-            let allowed = false, timedOut = false;
-            const vctl = new AbortController();
-            _docAbort = vctl;
-            const vtimer = setTimeout(() => { timedOut = true; vctl.abort(); }, 8000);
-            try {
-                const vres = await fetch(APPS_SCRIPT_URL, {
-                    method: 'POST',
-                    headers: { "Content-Type": "text/plain;charset=utf-8" },
-                    body: JSON.stringify({ action: 'verify_document_access', file_id: fileId, session: sessionPayload }),
-                    signal: vctl.signal
-                });
-                const vdata = await vres.json();
-                if (vdata.success) allowed = true;
-                else if (_isDefinitiveDenial(vdata)) { _denyDocAccess(vdata); return; }
-                else allowed = _localExpiryValid();
-            } catch (e) {
-                if (e && e.name === 'AbortError' && !timedOut) return;      // the student closed the viewer
-                allowed = _localExpiryValid();
-            } finally { clearTimeout(vtimer); }
-            if (!allowed) {
-                closeDocViewer();
-                showAppNotification("⏳ Session expired. Connect to internet to verify.", "warning");
+        // An older full copy in IndexedDB opens instantly (access was just verified above).
+        if (info.kind === 'pdf' && !info.converted) {
+            const legacy = await getOfflineDoc(fileId);
+            if (legacy && !stale()) {
+                _docProgressFinish();
+                if (loaderText()) loaderText().textContent = 'Loading from offline cache...';
+                renderPdfFromBase64(legacy, title);
                 return;
             }
-            if (loaderText()) loaderText().textContent = 'Loading from offline cache...';
-            renderPdfFromBase64(cachedCopy, title);
-            return;
         }
 
-        // ── 5. ONLINE, PDF, not cached: download via Gatekeeper (it verifies access itself) ──
-        if (loaderText()) loaderText().textContent = 'Downloading securely...';
-        _docAbort = new AbortController();
-        const _myAbort = _docAbort;
-        const data = await _fetchDocWithProgress(
-            JSON.stringify({ action: 'download_document', file_id: fileId, session: sessionPayload }),
-            _expectedDocBytes(fileId),
-            _myAbort.signal
-        );
-        if (_myAbort.signal.aborted) return;   // viewer was closed / another document opened meanwhile
-
-        if (data.success && data.data && data.data.base64) {
-            _docProgressFinish();
-            const pdfBytes = _b64ToBytes(data.data.base64);
-            data.data.base64 = null;                                      // free the big text copy
-            const saved = await saveDocOffline(fileId, pdfBytes.buffer);  // raw bytes: smaller, and opens without re-decoding
-            _reportOfflineSave(saved);
-            renderPdfFromBase64(pdfBytes, title);
-        } else {
-            _denyDocAccess(data);
-        }
+        const src = new UvSource(fileId, sessionPayload, info, false);
+        await _uvShow(src, title, mimeType);
     } catch (e) {
         if (e && e.name === 'AbortError') return;   // the student cancelled / closed the viewer
-        closeDocViewer();
-        showAppNotification("⚠️ Connection error. Could not load the document.", "error");
+        console.warn('[VIEWER]', e);
+        _uvLastResort(fileId, title, mimeType, (e && e.message) || '');
     }
 }
 
@@ -2895,7 +3591,7 @@ function thumbPump_() {
             method: 'POST',
             redirect: 'follow',
             headers: { "Content-Type": "text/plain;charset=utf-8" },
-            body: JSON.stringify({ action: 'GET_DOCUMENT_THUMBNAIL', file_id: job.id })
+            body: JSON.stringify({ action: 'GET_DOCUMENT_THUMBNAIL', file_id: job.id, session: _sessionForDocs() })
         })
         .then(function (r) { return r.json(); })
         .then(function (res) {
@@ -2936,7 +3632,7 @@ function vidThumbPump_() {
             method: 'POST',
             redirect: 'follow',
             headers: { "Content-Type": "text/plain;charset=utf-8" },
-            body: JSON.stringify({ action: 'GET_DOCUMENT_THUMBNAIL', file_id: job.id })
+            body: JSON.stringify({ action: 'GET_DOCUMENT_THUMBNAIL', file_id: job.id, session: _sessionForDocs() })
         })
         .then(function (r) { return r.json(); })
         .then(function (res) {
@@ -2950,6 +3646,18 @@ function vidThumbPump_() {
         .catch(function () { thumbShowIcon_(job.img, job.icon); })
         .then(function () { _vidThumbActive--; vidThumbPump_(); });
     }
+}
+
+/** Shown instead of the library when the server hides it from free users: ONE card with the count. */
+function _lockedLibraryHtml(icon, title, count, noun) {
+    const plural = noun + (count === 1 ? '' : 's');
+    return `<h2 style="text-align:center; margin-bottom:20px;">${icon} ${_vidEsc(title)}</h2>
+        <div class="doc-card" onclick="openPaymentModal()"
+             style="background:#2b3a55; padding:28px 15px; border-radius:10px; border-left:5px solid #ffc107; cursor:pointer; box-shadow:0 4px 8px rgba(0,0,0,0.2); text-align:center; max-width:420px; margin:20px auto;">
+            <div style="font-size:2.4em; font-weight:bold; color:#ffc107; line-height:1;">${count}</div>
+            <div style="font-size:1.15em; font-weight:bold; color:white; margin-top:8px;">${plural} available</div>
+        </div>
+        <div style="text-align:center; margin-top:20px;"><button class="restart-button" onclick="exitQuiz()">⬅ Back to Menu</button></div>`;
 }
 
 async function renderDocuments() {
@@ -2984,7 +3692,8 @@ async function renderDocuments() {
         const payload = JSON.stringify({
             action: 'GET_STUDENT_DOCS',
             course: currentCourse, 
-            term: currentTerm      
+            term: currentTerm,
+            session: _sessionForDocs()
         });
 
         // FETCHING FROM GATEKEEPER URL
@@ -2998,7 +3707,13 @@ async function renderDocuments() {
         const data = await response.json();
         const documents = data.documents || (data.data && data.data.documents) || [];
         const success = data.success || false;
+        const _hid = (data.data && data.data.locked) ? (Number(data.data.count) || 0) : undefined;
+        if (_hid !== undefined) _docsLocked[currentTermKey] = _hid; else delete _docsLocked[currentTermKey];
         if (success) { _docsCache[currentTermKey] = documents; applyModeAvailability(); }
+        if (success && _hid > 0) {   // the server hides the list from free users: show the count, not the files
+            container.innerHTML = _lockedLibraryHtml('📚', currentCourse + ' Library', _hid, 'document');
+            return;
+        }
         
         if (!success || documents.length === 0) {
             container.innerHTML = `<div style="text-align:center; padding:30px;"><h3>📂 Library Empty</h3><p>No active documents found.</p><button class="restart-button" onclick="exitQuiz()">Back to Menu</button></div>`;
@@ -3147,6 +3862,11 @@ async function renderVideos() {
             return;
         }
         applyModeAvailability();
+
+        if (videos.length === 0 && (_videosLocked[currentTermKey] || 0) > 0) {   // hidden from free users: count only
+            container.innerHTML = _lockedLibraryHtml('📺', currentCourse + ' Videos', _videosLocked[currentTermKey], 'video');
+            return;
+        }
 
         if (videos.length === 0) {
             container.innerHTML = `<div style="text-align:center; padding:30px;"><h3>📺 No Videos Yet</h3><p>No videos uploaded for this term.</p><button class="restart-button" onclick="exitQuiz()">Back to Menu</button></div>`;
@@ -4599,6 +5319,17 @@ function enableFullAccessUI() {
     const priceChip = document.getElementById('price-banner');
     if(priceChip) priceChip.style.display = 'none';
     clearDemoLocks();
+    // If the server hides the libraries from free users, load them again now that there is a session.
+    try {
+        const k = currentTermKey;
+        if (k && (_docsLocked[k] !== undefined || _videosLocked[k] !== undefined)) {
+            delete _docsCache[k]; delete _videosCache[k]; delete _docsLocked[k]; delete _videosLocked[k];
+            if (currentCourse && currentTerm) {
+                _loadDocsAvailability(k, currentCourse, currentTerm);
+                _loadVideosAvailability(k, currentCourse, currentTerm);
+            }
+        }
+    } catch (e) {}
 }
 
 function enableDemoUI() {
@@ -10182,4 +10913,33 @@ function _brandLogoImg(px, radius) {
     // Retry on window load in case the stylesheet resolved after this
     // script parsed. Cheap insurance, runs once.
     window.addEventListener('load', applyFavicon);
-})(); ; 
+})(); ;
+
+// ---- Open the app with ?diag=1 on the end of the address to see which Gatekeeper version is answering.
+(function () {
+    if (!/[?&]diag=1(&|$)/.test(location.search)) return;
+    function show(text) {
+        const d = document.createElement('div');
+        d.style.cssText = 'position:fixed;inset:0;z-index:99999;background:rgba(0,0,0,.92);color:#fff;padding:20px;overflow:auto;font:14px/1.5 monospace;white-space:pre-wrap;';
+        const b = document.createElement('button');
+        b.textContent = 'Close';
+        b.style.cssText = 'display:block;margin:0 0 14px;padding:10px 18px;font-size:16px;';
+        b.onclick = function () { d.remove(); };
+        d.appendChild(b);
+        d.appendChild(document.createTextNode(text));
+        document.body.appendChild(d);
+    }
+    function run() {
+        fetch(DOCS_SCRIPT_URL + '?page=status', { redirect: 'follow' })
+            .then(function (r) { return r.json(); })
+            .then(function (j) {
+                const isNew = !!(j && j.build && j.free_preview);
+                show((isNew
+                    ? 'GATEKEEPER IS UP TO DATE.\nIf docs_visible is false and free users still see the list, send this screen to support.\n\n'
+                    : 'GATEKEEPER IS OLD (or this app points at a different deployment).\nRedeploy: Deploy > Manage deployments > pencil > Version: New version > Deploy.\n\n')
+                    + JSON.stringify(j, null, 2) + '\n\nApp is calling:\n' + DOCS_SCRIPT_URL);
+            })
+            .catch(function (e) { show('Could not reach the Gatekeeper: ' + e.message + '\n\nApp is calling:\n' + DOCS_SCRIPT_URL); });
+    }
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', run); else run();
+})();
